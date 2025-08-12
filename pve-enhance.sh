@@ -4,19 +4,17 @@
 # PVE Web UI Enhancement Script
 #
 # Author: Reyanmatic
-# Version: 2.2 (Fixed a critical sed syntax error for the 'r' command)
+# Version: 2.3 (修复 pvemanagerlib.js 注入处 sed 花括号报错；修复动态JS注入在含有反引号情况下的安全注入方法)
 # Date: 2025-08-12
 #
 # Description:
-# This script enhances the Proxmox VE web interface by adding real-time display
-# for CPU temperature, frequency, power consumption, and detailed information
-# for NVMe and SATA drives. It also removes the subscription nag screen.
+# 本脚本增强 Proxmox VE Web 界面：实时显示 CPU 温度、频率、功耗，并显示 NVMe、SATA 磁盘信息；去除订阅提示。
 #
 # Features:
-# - Automatically detects and displays data from hardware sensors.
-# - Automatically detects and lists NVMe, SSD, and HDD information.
-# - Dynamically adjusts the UI layout to fit new elements.
-# - Includes robust backup and restore functionality.
+# - 自动检测硬件传感器并显示
+# - 自动检测 NVMe/SSD/HDD 并展示详细信息
+# - 动态调整UI高度
+# - 提供完善的备份/还原能力
 # ==============================================================================
 
 # --- 全局控制变量 ---
@@ -57,19 +55,19 @@ if ! command -v sensors > /dev/null; then
     fi
 fi
 
-# 检查功耗工具 turbostat (属于 linux-cpupower) 是否安装
+# 检查功耗工具 turbostat (通常由 linux-cpupower 提供) 是否安装
 if ! command -v turbostat > /dev/null; then
     echo "检测到系统缺少 'linux-cpupower'，这是显示CPU功耗所必需的。"
     echo "脚本将尝试为您自动安装..."
     if apt-get install -y linux-cpupower; then
         echo "'linux-cpupower' 安装成功！"
         # 为 turbostat 配置运行环境
-        modprobe msr
+        modprobe msr 2>/dev/null || true
         echo 'msr' > /etc/modules-load.d/turbostat-msr.conf
-        chmod +s /usr/sbin/turbostat
+        [ -x /usr/sbin/turbostat ] && chmod +s /usr/sbin/turbostat || true
     else
         echo -e "\033[31m自动安装 'linux-cpupower' 失败。\033[0m"
-        echo -e "请尝试手动执行命令进行安装：\033[34mapt-get install -y linux-cpupower && modprobe msr && echo 'msr' > /etc/modules-load.d/turbostat-msr.conf && chmod +s /usr/sbin/turbostat\033[0m"
+        echo -e "请尝试手动执行：\033[34mapt-get install -y linux-cpupower && modprobe msr && echo 'msr' > /etc/modules-load.d/turbostat-msr.conf && chmod +s /usr/sbin/turbostat\033[0m"
     fi
 fi
 
@@ -135,8 +133,8 @@ contentforpvejs=/tmp/.contentforpvejs.tmp
 
 # 为 turbostat 准备运行环境
 if [ -e /usr/sbin/turbostat ]; then
-    modprobe msr
-    chmod +s /usr/sbin/turbostat
+    modprobe msr 2>/dev/null || true
+    chmod +s /usr/sbin/turbostat 2>/dev/null || true
     echo 'msr' >/etc/modules-load.d/turbostat-msr.conf
 fi
 
@@ -164,7 +162,7 @@ $res->{cpuFreq} = `
 `;
 EOF
 
-# 生成注入到 PVE 前端 JS 文件 (pvemanagerlib.js) 的代码
+# 生成注入到 PVE 前端 JS 文件 (pvemanagerlib.js) 的固定模块
 cat >"$contentforpvejs" <<'EOF'
 //modbyshowtempfreq
     // 温度显示模块
@@ -230,18 +228,21 @@ EOF
 echo "正在检测 NVMe 硬盘..."
 nvi=0
 if $sNVMEInfo; then
-    chmod +s /usr/sbin/smartctl
+    chmod +s /usr/sbin/smartctl 2>/dev/null || true
     for nvme in $(ls /dev/nvme[0-9] 2>/dev/null); do
+        # 后端：为每个 NVMe 追加数据
         cat >>"$contentfornp" <<EOF
 \$res->{nvme$nvi} = \`smartctl $nvme -a -j\`;
 EOF
-        cat >>"$contentforpvejs" <<'EOF'
+        # 前端：使用占位符模板，避免反引号被 Shell 解析，同时正确替换索引
+        tmpchunk=$(mktemp)
+        cat >"$tmpchunk" <<'EOF'
         {
-            itemId: 'nvme${nvi}',
+            itemId: 'nvme__IDX__',
             colspan: 2,
             printBar: false,
-            title: gettext('NVMe ${nvi}'),
-            textField: 'nvme${nvi}',
+            title: gettext('NVMe __IDX__'),
+            textField: 'nvme__IDX__',
             renderer: function(value) {
                 try {
                     const v = JSON.parse(value);
@@ -258,6 +259,8 @@ EOF
             }
         },
 EOF
+        sed -e "s/__IDX__/$nvi/g" "$tmpchunk" >> "$contentforpvejs"
+        rm -f "$tmpchunk"
         nvi=$((nvi + 1))
     done
 fi
@@ -266,12 +269,13 @@ echo "完成，已为 $nvi 个 NVMe 硬盘添加监控模块。"
 echo "正在检测 SATA 硬盘..."
 sdi=0
 if $sODisksInfo; then
-    chmod +s /usr/sbin/smartctl
-    chmod +s /usr/sbin/hdparm
+    chmod +s /usr/sbin/smartctl 2>/dev/null || true
+    chmod +s /usr/sbin/hdparm 2>/dev/null || true
     for sd in $(ls /dev/sd[a-z] 2>/dev/null); do
         sdsn=$(basename "$sd")
         sdcr="/sys/block/$sdsn/queue/rotational"
         [ ! -f "$sdcr" ] && continue
+
         if [ "$(cat "$sdcr")" = "0" ]; then
             hddisk=false
             sdtype="SSD ${sdi}"
@@ -279,6 +283,8 @@ if $sODisksInfo; then
             hddisk=true
             sdtype="HDD ${sdi}"
         fi
+
+        # 后端：机械盘休眠时不唤醒，返回简要JSON
         cat >>"$contentfornp" <<EOF
 \$res->{sd$sdi} = \`
     if [ -b $sd ]; then
@@ -292,13 +298,16 @@ if $sODisksInfo; then
     fi
 \`;
 EOF
-        cat >>"$contentforpvejs" <<'EOF'
+
+        # 前端：同样使用占位符模板，避免反引号被Shell解析
+        tmpchunk=$(mktemp)
+        cat >"$tmpchunk" <<'EOF'
         {
-            itemId: 'sd${sdi}',
+            itemId: 'sd__IDX__',
             colspan: 2,
             printBar: false,
-            title: gettext('${sdtype}'),
-            textField: 'sd${sdi}',
+            title: gettext('__SDTYPE__'),
+            textField: 'sd__IDX__',
             renderer: function(value) {
                 try {
                     const v = JSON.parse(value);
@@ -315,6 +324,9 @@ EOF
             }
         },
 EOF
+        sed -e "s/__IDX__/$sdi/g" -e "s#__SDTYPE__#$sdtype#g" "$tmpchunk" >> "$contentforpvejs"
+        rm -f "$tmpchunk"
+
         sdi=$((sdi + 1))
     done
 fi
@@ -327,7 +339,7 @@ echo "--- 开始修改系统文件 ---"
 echo "正在修改 Nodes.pm..."
 if ! grep -q 'modbyshowtempfreq' "$np"; then
     [ ! -e "$np.$pvever.bak" ] && cp "$np" "$np.$pvever.bak" && echo "已备份 Nodes.pm -> Nodes.pm.$pvever.bak"
-    # 修正点：对于sed的'r'命令，不能使用花括号{}包裹，否则会产生语法错误。
+    # 正确用法：r 命令不包裹 {}
     if sed -i "/PVE::pvecfg::version_text()/r $contentfornp" "$np"; then
         echo "Nodes.pm 修改成功。"
         $dmode && sed -n "/PVE::pvecfg::version_text()/,+5p" "$np"
@@ -343,10 +355,22 @@ fi
 echo "正在修改 pvemanagerlib.js..."
 if ! grep -q 'modbyshowtempfreq' "$pvejs"; then
     [ ! -e "$pvejs.$pvever.bak" ] && cp "$pvejs" "$pvejs.$pvever.bak" && echo "已备份 pvemanagerlib.js -> pvemanagerlib.js.$pvever.bak"
-    # 此处的sed命令结构更复杂，保留花括号是正确的
-    if sed -i "/pveversion/,+3{ /},/r $contentforpvejs }" "$pvejs"; then
+
+    # 更稳健的注入方式：遍历可能的 'pveversion' 锚点，找到最近的 '},' 作为注入点
+    injected=0
+    while read -r ln; do
+        [ -z "$ln" ] && continue
+        close_line=$(awk -v s="$ln" 'NR>=s && NR<=s+40 && /},/ {print NR; exit}' "$pvejs")
+        if [ -n "$close_line" ]; then
+            sed -i "${close_line}r $contentforpvejs" "$pvejs"
+            injected=1
+            break
+        fi
+    done < <(grep -n 'pveversion' "$pvejs" | cut -d: -f1)
+
+    if [ "$injected" -eq 1 ]; then
         echo "pvemanagerlib.js 内容注入成功。"
-        $dmode && sed -n "/pveversion/,+8p" "$pvejs"
+        $dmode && sed -n "${close_line},$((close_line+60))p" "$pvejs"
     else
         echo "在 pvemanagerlib.js 中找不到内容注入点。"
         fail
@@ -357,6 +381,7 @@ if ! grep -q 'modbyshowtempfreq' "$pvejs"; then
     addHei=$((28 * addRs))
     $dmode && echo "检测到 $addRs 个新增条目，UI高度需增加 ${addHei}px。"
 
+    # 左侧面板高度
     wph_line=$(sed -n '/widget.pveNodeStatus/,+4{ /height:/{=;p;q} }' "$pvejs")
     if [ -n "$wph_line" ]; then
         wph=$(sed -n -E "${wph_line}s/[^0-9]*([0-9]+).*/\1/p" "$pvejs")
@@ -366,6 +391,7 @@ if ! grep -q 'modbyshowtempfreq' "$pvejs"; then
         echo "未找到左侧面板高度修改点，跳过。"
     fi
 
+    # 右侧面板高度
     nph_line=$(sed -n '/nodeStatus:\s*nodeStatus/,+10{ /minHeight:/{=;p;q} }' "$pvejs")
     if [ -n "$nph_line" ]; then
         nph=$(sed -n -E "${nph_line}s/[^0-9]*([0-9]+).*/\1/p" "$pvejs")
