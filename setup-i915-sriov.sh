@@ -1,304 +1,480 @@
 #!/bin/bash
 
 # ===================================================================================
-#
-# Script Name: setup-i915-sriov.sh
-# Description: 一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
-# Author: Generated for iHub-2020
-# Version: 1.2 (增加动态获取内核支持范围功能)
-# GitHub: https://github.com/iHub-2020/PVE_Utilities
-#
+# Script Name:   setup-i915-sriov.sh
+# Description:   一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
+# Author:        Reyanmatic
+# Version:       1.5.1 (修复粘贴错误，增强回滚与清理逻辑，优化交互)
+# GitHub:        https://github.com/iHub-2020/PVE_Utilities
 # ===================================================================================
 
+set -Eeuo pipefail
+
+# --- 颜色与统一输出 ---
+C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
+step() { echo -e "\n${C_BLUE}==>${C_RESET} ${C_YELLOW}$1${C_RESET}"; }
+ok() { echo -e "${C_GREEN}  [成功]${C_RESET} $1"; }
+warn() { echo -e "${C_YELLOW}  [提示]${C_RESET} $1"; }
+fail() { echo -e "${C_RED}  [错误]${C_RESET} $1"; }
+
 # --- 全局变量与常量 ---
-readonly SCRIPT_VERSION="1.2"
-# 下面这些变量将由函数动态填充
-DKMS_PACKAGE_URL=""
-DKMS_PACKAGE_NAME=""
+readonly SCRIPT_VERSION="1.5.1"
+readonly STATE_DIR="/var/tmp/i915-sriov-setup"
+readonly BACKUP_DIR="${STATE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
+
+# --- 全局变量（动态填充） ---
+ENV_TYPE=""            # PVE_HOST / GUEST_VM
+OS_ID=""               # debian / ubuntu
+OS_CODENAME=""         # bookworm / jammy / noble ...
+CURRENT_KERNEL=""      # uname -r
+CURRENT_KMM=""         # 主次版本 X.Y
 SUPPORTED_KERNEL_MIN=""
 SUPPORTED_KERNEL_MAX=""
+DKMS_PACKAGE_URL=""
+DKMS_PACKAGE_NAME=""
 
-# --- 颜色定义 ---
-C_RESET='\033[0m'
-C_RED='\033[0;31m'
-C_GREEN='\033[0;32m'
-C_YELLOW='\033[0;33m'
-C_BLUE='\033[0;34m'
-
-# --- 工具函数 ---
-print_msg() {
-    local color=$1
-    local message=$2
-    echo -e "${color}${message}${C_RESET}"
-}
-
-check_root() {
-    if [[ "$EUID" -ne 0 ]]; then
-        print_msg "$C_RED" "错误：本脚本需要以 root 权限运行。请使用 'sudo ./setup-i915-sriov.sh'。正在退出..."
-        exit 1
-    fi
-}
-
-check_dependencies() {
-    local missing_deps=()
-    for dep in curl bc; do
-        if ! command -v "$dep" &> /dev/null; then
-            missing_deps+=("$dep")
-        fi
-    done
-
-    if [[ ${#missing_deps[@]} -gt 0 ]]; then
-        print_msg "$C_YELLOW" "检测到以下核心依赖未安装: ${missing_deps[*]}"
-        read -p "是否要现在安装它们? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            apt update && apt install -y "${missing_deps[@]}"
-        else
-            print_msg "$C_RED" "用户取消安装依赖。脚本无法继续。正在退出。"
-            exit 1
-        fi
-    fi
-}
-
-
-# --- 备份与回滚机制 ---
-BACKUP_DIR="/tmp/sriov_setup_backup_$(date +%Y%m%d_%H%M%S)"
+# --- 回滚相关 ---
 CONFIG_FILES_TO_BACKUP=()
 
-setup_backup_and_trap() {
-    mkdir -p "$BACKUP_DIR"
-    print_msg "$C_BLUE" "配置文件备份目录已创建于: ${BACKUP_DIR}"
-    # 设置错误陷阱
-    trap 'error_handler $? $LINENO' ERR
-}
-
 backup_file() {
-    local file_path=$1
-    if [[ -f "$file_path" && ! " ${CONFIG_FILES_TO_BACKUP[@]} " =~ " ${file_path} " ]]; then
-        print_msg "$C_BLUE" "正在备份 ${file_path} 到 ${BACKUP_DIR}/"
-        cp -p "$file_path" "$BACKUP_DIR/"
-        CONFIG_FILES_TO_BACKUP+=("$file_path")
+    local f="$1"
+    [[ -f "$f" ]] || return 0
+    if [[ ! " ${CONFIG_FILES_TO_BACKUP[*]} " =~ " $f " ]]; then
+        mkdir -p "$(dirname "$BACKUP_DIR/$f")"
+        cp -a "$f" "$BACKUP_DIR/$f"
+        CONFIG_FILES_TO_BACKUP+=("$f")
+        warn "已备份: $f"
     fi
 }
 
 restore_from_backup() {
-    print_msg "$C_YELLOW" "检测到错误，正在尝试从备份中恢复配置文件..."
     if [[ ${#CONFIG_FILES_TO_BACKUP[@]} -eq 0 ]]; then
-        print_msg "$C_YELLOW" "没有配置文件被修改，无需恢复。"
-        return
+        warn "无需恢复（未修改配置文件）。"; return 0
     fi
-
-    for file_path in "${CONFIG_FILES_TO_BACKUP[@]}"; do
-        local backup_file_path="${BACKUP_DIR}/$(basename "$file_path")"
-        if [[ -f "$backup_file_path" ]]; then
-            print_msg "$C_YELLOW" "正在恢复 ${file_path}..."
-            cp -p "$backup_file_path" "$file_path"
+    warn "正在从备份恢复配置文件..."
+    for f in "${CONFIG_FILES_TO_BACKUP[@]}"; do
+        local b="$BACKUP_DIR/$f"
+        if [[ -f "$b" ]]; then
+            # 【已优化】确保恢复时目标目录存在
+            mkdir -p "$(dirname "$f")"
+            cp -a "$b" "$f"
+            warn "已恢复: $f"
         fi
     done
-    print_msg "$C_GREEN" "配置文件恢复完成。"
+    ok "配置文件恢复完成。"
 }
 
-error_handler() {
-    local exit_code=$1
-    local line_number=$2
-    print_msg "$C_RED" "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    print_msg "$C_RED" "!!  脚本在第 ${line_number} 行发生错误，退出码: ${exit_code}"
-    print_msg "$C_RED" "!!  正在执行自动回滚..."
-    print_msg "$C_RED" "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+on_error() {
+    local code=$?
+    fail "脚本执行中断，退出码: $code。将尝试自动回滚配置文件。"
     restore_from_backup
-    print_msg "$C_RED" "回滚已执行。请检查上述错误信息。"
-    print_msg "$C_RED" "注意：已安装的软件包无法自动卸载，可能需要手动清理。"
-    exit "$exit_code"
+    warn "注意：已安装的软件包不会自动卸载，如需彻底回退请手动卸载相关包。"
+    exit $code
+}
+trap on_error ERR
+trap 'fail "收到中断信号"; on_error' INT TERM
+
+# --- 工具函数 ---
+require_root() { [[ $EUID -ne 0 ]] && { fail "本脚本需要 root 权限，请使用 sudo 运行。"; exit 1; }; }
+cmd_exists() { command -v "$1" &>/dev/null; }
+pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"; }
+pkg_exists() { apt-cache show "$1" &>/dev/null; }
+ver_in_range() { dpkg --compare-versions "$1" ge "$2" && dpkg --compare-versions "$1" le "$3"; }
+apt_install() {
+    local pkgs=("$@")
+    DEBIAN_FRONTEND=noninteractive apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${pkgs[@]}"
 }
 
-# --- 核心逻辑函数 ---
+# --- 核心流程 ---
 
-fetch_latest_dkms_info() {
-    print_msg "$C_BLUE" "--- 步骤 0a: 获取最新的 DKMS 模块版本 ---"
-    
-    print_msg "$C_BLUE" "正在通过 GitHub API 查询最新版本..."
-    local api_url="https://api.github.com/repos/strongtz/i915-sriov-dkms/releases/latest"
-    local response
-    response=$(curl -s "$api_url")
-
-    DKMS_PACKAGE_URL=$(echo "$response" | grep '"browser_download_url":' | grep 'amd64.deb' | sed -E 's/.*"browser_download_url": "([^"]+)".*/\1/')
-    
-    if [[ -z "$DKMS_PACKAGE_URL" ]]; then
-        print_msg "$C_RED" "错误：无法从 GitHub API 获取最新的 .deb 下载链接。"
-        print_msg "$C_YELLOW" "这可能是网络问题，或 GitHub API 速率限制。请稍后重试。"
-        exit 1
+check_dependencies() {
+    step "检查并安装所需依赖"
+    local deps=(curl jq bc dkms build-essential pciutils lsb-release)
+    local miss=()
+    for d in "${deps[@]}"; do cmd_exists "$d" || miss+=("$d"); done
+    if [[ ${#miss[@]} -gt 0 ]]; then
+        warn "缺少依赖: ${miss[*]}，将自动安装。"
+        apt_install "${miss[@]}"
     fi
-    
-    DKMS_PACKAGE_NAME=$(basename "$DKMS_PACKAGE_URL")
-    
-    print_msg "$C_GREEN" "成功获取最新版本信息:"
-    print_msg "$C_GREEN" "  - 包名: ${DKMS_PACKAGE_NAME}"
+    ok "依赖检查完成。"
 }
-
-# #################################################
-#  新增功能：动态获取内核支持范围
-# #################################################
-fetch_supported_kernel_range() {
-    print_msg "$C_BLUE" "--- 步骤 0b: 自动检测内核支持范围 ---"
-    local readme_url="https://raw.githubusercontent.com/strongtz/i915-sriov-dkms/master/README.md"
-    print_msg "$C_BLUE" "正在从项目的 README 文件中解析版本要求..."
-    
-    local version_line
-    version_line=$(curl -s "$readme_url" | grep 'SR-IOV support for linux')
-    
-    if [[ -z "$version_line" ]]; then
-        print_msg "$C_RED" "错误：无法在 README 中找到内核版本信息行。"
-        print_msg "$C_YELLOW" "可能是项目描述已更改。脚本需要更新。"
-        exit 1
-    fi
-    
-    # 使用 sed 和正则表达式提取版本范围，例如 "6.8-6.15"
-    local version_range
-    version_range=$(echo "$version_line" | sed -n 's/.*linux \([0-9.]\+-[0-9.]\+\).*/\1/p')
-
-    if [[ -z "$version_range" ]]; then
-        print_msg "$C_RED" "错误：无法从描述中解析出 'X.Y-Z.W' 格式的版本范围。"
-        exit 1
-    fi
-    
-    SUPPORTED_KERNEL_MIN=$(echo "$version_range" | cut -d'-' -f1)
-    SUPPORTED_KERNEL_MAX=$(echo "$version_range" | cut -d'-' -f2)
-
-    if [[ -z "$SUPPORTED_KERNEL_MIN" || -z "$SUPPORTED_KERNEL_MAX" ]]; then
-        print_msg "$C_RED" "错误：解析出的内核版本为空。"
-        exit 1
-    fi
-
-    print_msg "$C_GREEN" "成功解析到内核支持范围: ${SUPPORTED_KERNEL_MIN} - ${SUPPORTED_KERNEL_MAX}"
-}
-
 
 detect_environment() {
-    print_msg "$C_BLUE" "正在检测运行环境..."
-    if command -v pveversion &> /dev/null; then
+    step "检测运行环境"
+    if cmd_exists pveversion; then
         ENV_TYPE="PVE_HOST"
-        print_msg "$C_GREEN" "检测到 PVE 宿主机环境。"
-    else
+    elif cmd_exists systemd-detect-virt && [[ "$(systemd-detect-virt 2>/dev/null)" != "none" ]]; then
         ENV_TYPE="GUEST_VM"
-        print_msg "$C_GREEN" "检测到虚拟机环境。"
+    else
+        warn "无法自动判定环境，请选择："
+        read -rp "  请输入数字 [0=PVE宿主机, 1=虚拟机]: " ans
+        [[ "$ans" == "0" ]] && ENV_TYPE="PVE_HOST" || ENV_TYPE="GUEST_VM"
     fi
+    ok "环境类型: ${ENV_TYPE}"
 
+    step "检测操作系统"
     if [[ -f /etc/os-release ]]; then
         # shellcheck source=/dev/null
-        source /etc/os-release
-        OS_ID=$ID
-        print_msg "$C_GREEN" "检测到操作系统: ${OS_ID}"
+        . /etc/os-release
+        OS_ID="${ID:-}"
+        OS_CODENAME="${VERSION_CODENAME:-$(lsb_release -sc 2>/dev/null || true)}"
+    fi
+    if [[ -z "$OS_ID" || -z "$OS_CODENAME" ]]; then
+        warn "无法自动判定系统，请选择："
+        read -rp "  请输入数字 [0=Debian, 1=Ubuntu]: " ans
+        if [[ "$ans" == "0" ]]; then OS_ID="debian"; OS_CODENAME="$(lsb_release -sc 2>/dev/null || echo bookworm)"; else OS_ID="ubuntu"; OS_CODENAME="$(lsb_release -sc 2>/dev/null || echo noble)"; fi
+    fi
+    ok "操作系统: ${OS_ID} (${OS_CODENAME})"
+}
+
+fetch_latest_dkms_info() {
+    step "获取 i915-sriov-dkms 最新发布信息"
+    local api="https://api.github.com/repos/strongtz/i915-sriov-dkms/releases/latest"
+    local headers=(-H "Accept: application/vnd.github+json")
+    [[ -n "${GITHUB_TOKEN:-}" ]] && headers+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+
+    local json; json=$(curl -fsSL "${headers[@]}" "$api" || true)
+    DKMS_PACKAGE_URL=$(echo "$json" | jq -r '.assets[]?.browser_download_url | select(test("amd64\.deb$"))' | head -n1)
+
+    if [[ -z "${DKMS_PACKAGE_URL}" ]]; then
+        fail "自动获取 .deb 下载地址失败（可能是网络或 API 限制）。"
+        read -rp "  请手动粘贴 .deb 文件下载链接: " DKMS_PACKAGE_URL
+        [[ -z "${DKMS_PACKAGE_URL}" ]] && { fail "未提供链接，无法继续。"; exit 1; }
+    fi
+    DKMS_PACKAGE_NAME="$(basename "$DKMS_PACKAGE_URL")"
+    ok "将使用 DKMS 包: ${DKMS_PACKAGE_NAME}"
+}
+
+fetch_supported_kernel_range() {
+    step "自动检测内核支持范围"
+    local range=""
+    local readme_url="https://raw.githubusercontent.com/strongtz/i915-sriov-dkms/master/README.md"
+
+    local txt; txt=$(curl -fsSL "$readme_url" || true)
+    range=$(echo "$txt" | sed -n -E 's/.*[Ll]inux[[:space:]]+([0-9]+\.[0-9]+)-([0-9]+\.[0-9]+).*/\1-\2/p' | head -n1)
+
+    if [[ -z "$range" ]]; then
+        warn "从 README 解析失败，尝试从最新 Release 标题解析..."
+        local api="https://api.github.com/repos/strongtz/i915-sriov-dkms/releases/latest"
+        local json; json=$(curl -fsSL "$api" || true)
+        local title; title=$(echo "$json" | jq -r '.name // .tag_name // empty')
+        range=$(echo "$title" | sed -n -E 's/.*([0-9]+\.[0-9]+)-([0-9]+\.[0-9]+).*/\1-\2/p' | head -n1)
+    fi
+
+    if [[ -z "$range" ]]; then
+        warn "无法自动解析支持的内核范围。"
+        read -rp "  请手动输入支持范围（例如 6.8-6.15）: " range
+    fi
+
+    SUPPORTED_KERNEL_MIN="${range%%-*}"
+    SUPPORTED_KERNEL_MAX="${range##*-}"
+
+    if [[ -z "$SUPPORTED_KERNEL_MIN" || -z "$SUPPORTED_KERNEL_MAX" ]]; then
+        fail "解析内核支持范围失败，请检查输入或上游项目页面后重试。"; exit 1
+    fi
+    ok "解析到内核支持范围: ${SUPPORTED_KERNEL_MIN} - ${SUPPORTED_KERNEL_MAX}"
+}
+
+collect_kernel_info() {
+    step "收集当前内核信息"
+    CURRENT_KERNEL="$(uname -r)"
+    CURRENT_KMM="$(uname -r | sed -E 's/^([0-9]+\.[0-9]+).*/\1/')"
+    ok "当前运行内核: ${CURRENT_KERNEL} (主次版本: ${CURRENT_KMM})"
+}
+
+ensure_headers_for_running_kernel() {
+    step "检查并安装当前内核的头文件"
+    local candidates=(
+        "linux-headers-${CURRENT_KERNEL}"
+        "pve-headers-${CURRENT_KERNEL}"
+        "linux-headers-$(echo "${CURRENT_KERNEL}" | sed 's/-pve//')"
+        "proxmox-headers-${CURRENT_KMM}"
+    )
+    if [[ "$OS_ID" == "debian" ]]; then
+        candidates+=("linux-headers-amd64")
     else
-        print_msg "$C_RED" "无法识别操作系统。正在退出。"
+        candidates+=("linux-headers-generic")
+    fi
+
+    for pkg in "${candidates[@]}"; do
+        if pkg_installed "$pkg"; then ok "头文件包已安装: $pkg"; return 0; fi
+        if pkg_exists "$pkg"; then
+            warn "准备安装头文件包: $pkg"
+            apt_install "$pkg"
+            ok "头文件安装完成: $pkg"
+            return 0
+        fi
+    done
+    warn "未能找到与当前内核完全匹配的头文件包，DKMS 构建可能失败。"
+}
+
+select_pve_kernel_meta_in_range() {
+    local min="$1" max="$2"
+    step "为 PVE 搜索范围为 [${min}-${max}] 的内核元包"
+
+    local names; names=$(apt-cache search --names-only '^(proxmox|pve)-kernel-[0-9]+\.[0-9]+$' 2>/dev/null | awk '{print $1}' || true)
+    local versions; versions=$(echo "$names" | sed -E 's/.*-([0-9]+\.[0-9]+)$/\1/' | sort -V | uniq || true)
+
+    local best=""
+    for v in $versions; do
+        if ver_in_range "$v" "$min" "$max"; then best="$v"; fi
+    done
+    if [[ -z "$best" ]]; then
+        fail "未找到满足范围的 PVE 内核元包。请检查 PVE 源或手动安装。"
         exit 1
     fi
+    
+    local best_name="" best_hdr=""
+    if echo "$names" | grep -q "proxmox-kernel-$best"; then
+        best_name="proxmox-kernel-$best"; best_hdr="proxmox-headers-$best"
+    else
+        best_name="pve-kernel-$best";     best_hdr="pve-headers-$best"
+    fi
+    echo "${best_name}|${best_hdr}"
 }
 
-check_and_manage_kernel() {
-    print_msg "$C_BLUE" "--- 步骤 1: 内核版本检查与管理 ---"
-    CURRENT_KERNEL=$(uname -r)
-    KERNEL_MAJOR_MINOR=$(echo "$CURRENT_KERNEL" | awk -F'.' '{print $1"."$2}')
+upgrade_kernel_if_needed() {
+    step "检查当前内核版本是否在支持范围内"
+    if ver_in_range "$CURRENT_KMM" "$SUPPORTED_KERNEL_MIN" "$SUPPORTED_KERNEL_MAX"; then
+        ok "当前内核 ${CURRENT_KMM} 符合范围 [${SUPPORTED_KERNEL_MIN}-${SUPPORTED_KERNEL_MAX}]"
+        return
+    fi
+    warn "当前内核 ${CURRENT_KMM} 不在支持范围 [${SUPPORTED_KERNEL_MIN}-${SUPPORTED_KERNEL_MAX}]"
+    read -rp "  是否自动升级到支持范围内的内核？[y/N]: " ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then fail "用户取消内核升级，安装无法继续。"; exit 1; fi
 
-    print_msg "$C_BLUE" "当前运行内核: ${CURRENT_KERNEL}"
-    
-    if (( $(echo "$KERNEL_MAJOR_MINOR >= $SUPPORTED_KERNEL_MIN" | bc -l) )) && (( $(echo "$KERNEL_MAJOR_MINOR <= $SUPPORTED_KERNEL_MAX" | bc -l) )); then
-        print_msg "$C_GREEN" "内核版本 ${KERNEL_MAJOR_MINOR} 符合要求 (${SUPPORTED_KERNEL_MIN} - ${SUPPORTED_KERNEL_MAX})。"
-    else
-        print_msg "$C_YELLOW" "内核版本 ${KERNEL_MAJOR_MINOR} 不在支持范围 (${SUPPORTED_KERNEL_MIN} - ${SUPPORTED_KERNEL_MAX})，需要升级。"
-        read -p "是否要自动升级内核? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            upgrade_kernel
-        else
-            print_msg "$C_RED" "用户取消内核升级。脚本无法继续。正在退出。"
-            exit 1
+    if [[ "$ENV_TYPE" == "PVE_HOST" ]]; then
+        local pair; pair=$(select_pve_kernel_meta_in_range "$SUPPORTED_KERNEL_MIN" "$SUPPORTED_KERNEL_MAX")
+        apt_install "${pair%|*}" "${pair#*|}"
+    else # GUEST_VM
+        if [[ "$OS_ID" == "debian" ]]; then
+            local codename="${OS_CODENAME:-bookworm}"
+            local backlist="/etc/apt/sources.list.d/${codename}-backports.list"
+            backup_file "$backlist"
+            echo "deb http://deb.debian.org/debian ${codename}-backports main contrib non-free-firmware" > "$backlist"
+            DEBIAN_FRONTEND=noninteractive apt-get update -y
+            DEBIAN_FRONTEND=noninteractive apt-get -y -t "${codename}-backports" install linux-image-amd64 linux-headers-amd64 firmware-misc-nonfree
+        else # ubuntu
+            local series; series="$(lsb_release -rs 2>/dev/null || echo 24.04)"
+            local hwe="linux-generic-hwe-${series}"
+            local to_install=()
+            if pkg_exists "$hwe"; then to_install+=("$hwe"); else to_install+=("linux-generic" "linux-headers-generic"); fi
+            # 【已优化】Ubuntu 下，如果存在 extra 包，一并安装
+            local extra_pkg="linux-modules-extra-${CURRENT_KERNEL}"
+            if pkg_exists "$extra_pkg"; then to_install+=("$extra_pkg"); fi
+            apt_install "${to_install[@]}"
         fi
     fi
-    
-    cleanup_old_kernels
-}
-
-upgrade_kernel() {
-    print_msg "$C_BLUE" "正在升级内核..."
-    apt update
-    if [[ "$ENV_TYPE" == "PVE_HOST" ]]; then
-        # 这里的 6.8 是基于当前已知情况，未来可能需要更智能的判断
-        print_msg "$C_BLUE" "为 PVE 宿主机安装 ${SUPPORTED_KERNEL_MIN} 系列内核..."
-        apt install -y "proxmox-kernel-${SUPPORTED_KERNEL_MIN}" "proxmox-headers-${SUPPORTED_KERNEL_MIN}"
-    elif [[ "$OS_ID" == "debian" ]];
-        print_msg "$C_BLUE" "为 Debian 客户机从 backports 安装新内核..."
-        backup_file "/etc/apt/sources.list"
-        echo "deb http://deb.debian.org/debian bookworm-backports main contrib non-free-firmware" > /etc/apt/sources.list.d/backports.list
-        apt update
-        apt -t bookworm-backports install -y linux-image-amd64 linux-headers-amd64 firmware-misc-nonfree
-    elif [[ "$OS_ID" == "ubuntu" ]]; then
-        print_msg "$C_BLUE" "为 Ubuntu 客户机安装 HWE 内核..."
-        apt install -y linux-generic-hwe-24.04
-    fi
-    print_msg "$C_YELLOW" "内核已升级。需要重启系统以应用新内核。请在重启后重新运行此脚本。"
+    warn "内核已升级，必须重启系统后再次运行本脚本才能继续。"
     exit 0
 }
 
 cleanup_old_kernels() {
-    # 此函数逻辑不变
-    mapfile -t INSTALLED_KERNELS < <(dpkg -l | grep -E 'pve-kernel|proxmox-kernel|linux-image' | grep -v 'tools\|common' | awk '{print $2}')
-    if [[ ${#INSTALLED_KERNELS[@]} -le 2 ]]; then return; fi
-    print_msg "$C_YELLOW" "检测到多个内核版本。是否要检查并清理旧内核? (y/N)"
-    read -p "" -n 1 -r; echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then return; fi
+    step "检查是否需要清理旧内核"
+    mapfile -t installed_kernel_packages < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'pve-kernel-*' 'proxmox-kernel-*' 2>/dev/null | grep -v 'common' || true)
+    if [[ ${#installed_kernel_packages[@]} -lt 2 ]]; then ok "无需清理（已安装内核数量 < 2）。"; return; fi
+
+    read -rp "  是否执行“仅保留当前运行内核（可选再保留最近一个）”的清理？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { warn "跳过内核清理。"; return 0; }
+
+    read -rp "  是否保留一个最近的旧内核作为回退？[y/N]: " keep_old
     
-    # ... (省略与上一版相同的清理逻辑)
+    local running_pkg; running_pkg=$(dpkg-query -S "/boot/vmlinuz-${CURRENT_KERNEL}" 2>/dev/null | cut -d: -f1 || true)
+    local keep_set=("$running_pkg")
+    
+    if [[ "$keep_old" =~ ^[Yy]$ ]]; then
+        local latest_old; latest_old=$(printf "%s\n" "${installed_kernel_packages[@]}" | grep -v "$running_pkg" | sort -V | tail -n 1)
+        [[ -n "$latest_old" ]] && keep_set+=("$latest_old")
+    fi
+
+    local to_remove=()
+    mapfile -t all_related_packages < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'linux-headers-*' 'pve-kernel-*' 'proxmox-kernel-*' 'pve-headers-*' 'proxmox-headers-*' 2>/dev/null | grep -v 'common' || true)
+    for pkg in "${all_related_packages[@]}"; do
+        local kernel_base_name; kernel_base_name=$(echo "$pkg" | sed -E 's/linux-(image|headers)-//; s/(pve|proxmox)-(kernel|headers)-//')
+        local should_keep=0
+        for keep in "${keep_set[@]}"; do
+            if [[ "$keep" == *"$kernel_base_name"* ]]; then
+                should_keep=1; break
+            fi
+        done
+        (( should_keep == 0 )) && to_remove+=("$pkg")
+    done
+
+    if [[ ${#to_remove[@]} -eq 0 ]]; then ok "未发现可清理的旧内核包。"; return; fi
+    warn "将要移除以下内核相关包（不含保留项）:"
+    printf '    - %s\n' "${to_remove[@]}"
+    read -rp "  确认删除？[y/N]: " go
+    if [[ "$go" =~ ^[Yy]$ ]]; then
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y "${to_remove[@]}"
+        DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
+        ok "旧内核清理完成。"
+    else
+        warn "取消清理旧内核。"
+    fi
 }
 
 configure_kernel_params() {
-    # 此函数逻辑不变
-    print_msg "$C_BLUE" "--- 步骤 2: 配置内核参数 ---"
-    # ... (省略与上一版相同的参数配置逻辑)
+    step "配置内核与模块参数"
+    local grub_file="/etc/default/grub"
+    backup_file "$grub_file"
+
+    if ! grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file"; then
+        echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"' >> "$grub_file"
+    fi
+    local cmdline; cmdline=$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" | cut -d'"' -f2)
+
+    for param in "intel_iommu=on" "iommu=pt"; do
+        [[ " $cmdline " =~ " $param " ]] || cmdline="$cmdline $param"
+    done
+    cmdline=$(echo "$cmdline" | xargs)
+
+    sed -i -E 's|^(GRUB_CMDLINE_LINUX_DEFAULT=").*"|\1'"$cmdline"'"|' "$grub_file"
+    ok "已在 GRUB 设置: $cmdline"
+
+    local modconf="/etc/modprobe.d/i915-sriov-dkms.conf"
+    backup_file "$modconf"
+    : > "$modconf" # 清空文件
+
+    read -rp "  是否添加 xe 黑名单（推荐）？[Y/n]: " bxe
+    if [[ ! "$bxe" =~ ^[Nn]$ ]]; then
+        echo "blacklist xe" >> "$modconf"
+        ok "已添加 xe 黑名单"
+    fi
+
+    read -rp "  是否设置 i915.enable_guc=3（推荐）？[Y/n]: " eg
+    if [[ ! "$eg" =~ ^[Nn]$ ]]; then
+        echo "options i915 enable_guc=3" >> "$modconf"
+        ok "已设置: options i915 enable_guc=3"
+    fi
+
+    if [[ "$ENV_TYPE" == "PVE_HOST" ]]; then
+        read -rp "  [宿主机] 是否设置 i915.max_vfs 以启用 SR-IOV？[y/N]: " mv
+        if [[ "$mv" =~ ^[Yy]$ ]]; then
+            read -rp "    请输入要创建的 VF 数量 (1-7，或实际硬件上限): " vf_count
+            if [[ "$vf_count" =~ ^[1-9][0-9]*$ ]]; then
+                echo "options i915 max_vfs=${vf_count}" >> "$modconf"
+                ok "已设置: options i915 max_vfs=${vf_count}"
+            else
+                warn "输入无效，跳过 max_vfs 设置。"
+            fi
+        fi
+    fi
+
+    if cmd_exists update-grub; then update-grub; else grub-mkconfig -o /boot/grub/grub.cfg; fi
+    if cmd_exists update-initramfs; then update-initramfs -u; fi
+    if cmd_exists proxmox-boot-tool; then proxmox-boot-tool refresh; fi
+    ok "引导与 initramfs 已更新。"
 }
 
-install_dependencies_and_dkms() {
-    # 此函数逻辑不变
-    print_msg "$C_BLUE" "--- 步骤 3: 安装依赖并部署 DKMS 模块 ---"
-    # ... (省略与上一版相同的安装逻辑)
+install_dkms_package() {
+    step "安装 DKMS 包"
+    ensure_headers_for_running_kernel
+
+    local tmp_pkg="/tmp/${DKMS_PACKAGE_NAME}"
+    warn "正在下载 DKMS 包..."
+    curl -fSL "$DKMS_PACKAGE_URL" -o "$tmp_pkg"
+
+    warn "正在安装 DKMS 包（若提示依赖问题会自动修复）..."
+    dpkg -i "$tmp_pkg" || DEBIAN_FRONTEND=noninteractive apt-get -f install -y
+
+    ok "DKMS 包安装完成。"
+    dkms status
 }
 
 configure_vf() {
-    # 此函数逻辑不变
-    if [[ "$ENV_TYPE" != "PVE_HOST" ]]; then return; fi
-    print_msg "$C_BLUE" "--- 步骤 4: 创建 SR-IOV 虚拟功能 (VF) ---"
-    # ... (省略与上一版相同的VF配置逻辑)
+    [[ "$ENV_TYPE" == "PVE_HOST" ]] || return 0
+    step "创建 SR-IOV VF（可选）"
+
+    local devdir="/sys/class/drm/card0/device"
+    if [[ ! -d "$devdir" || ! -f "$devdir/sriov_totalvfs" ]]; then
+        warn "未在默认路径 ${devdir} 发现 SR-IOV 接口。"
+        read -rp "  请手动输入 iGPU 的 PCI 地址（如 0000:00:02.0，留空跳过）: " pci_addr
+        [[ -z "$pci_addr" ]] && { warn "跳过 VF 创建。"; return 0; }
+        devdir="/sys/bus/pci/devices/$pci_addr"
+        if [[ ! -d "$devdir" ]]; then fail "提供的路径无效，跳过 VF 创建。"; return 0; fi
+    fi
+
+    local total=0
+    [[ -f "$devdir/sriov_totalvfs" ]] && total=$(cat "$devdir/sriov_totalvfs")
+    if [[ "$total" -le 0 ]]; then
+        warn "该设备报告不支持 SR-IOV（totalvfs=$total），跳过。"
+        return 0
+    fi
+    ok "设备最大 VF 数量：$total"
+
+    read -rp "  请输入要创建的 VF 数量（1-$total，回车跳过）: " n
+    [[ -z "$n" ]] && { warn "跳过 VF 创建。"; return 0; }
+    if ! [[ "$n" -ge 1 && "$n" -le "$total" ]]; then
+        warn "输入无效，跳过 VF 创建。"; return 0
+    fi
+    
+    echo 0 > "$devdir/sriov_numvfs"
+    echo "$n" > "$devdir/sriov_numvfs"
+    ok "已临时创建 $n 个 VF。"
+
+    read -rp "  是否将 VF 创建持久化，以便开机自动生效？[y/N]: " p
+    [[ "$p" =~ ^[Yy]$ ]] || { warn "跳过持久化。"; return 0; }
+
+    echo "  请选择持久化方式："
+    echo "    1) sysfsutils (传统，写入 /etc/sysfs.conf)"
+    echo "    2) systemd 服务 (推荐，创建 i915-sriov-vf.service)"
+    read -rp "  请输入数字 [1/2]（默认 2）： " m
+    m="${m:-2}"
+
+    if [[ "$m" == "1" ]]; then
+        local sysfs_file="/etc/sysfs.conf"
+        backup_file "$sysfs_file"
+        apt_install sysfsutils
+        local rel_path; rel_path=$(realpath --relative-to=/sys "$devdir")
+        sed -i '\|sriov_numvfs|d' "$sysfs_file"
+        echo "${rel_path}/sriov_numvfs = ${n}" >> "$sysfs_file"
+        ok "已写入 $sysfs_file"
+    else
+        local svc_file="/etc/systemd/system/i915-sriov-vf.service"
+        backup_file "$svc_file"
+        cat > "$svc_file" <<EOF
+[Unit]
+Description=Configure i915 SR-IOV VFs
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 0 > ${devdir}/sriov_numvfs; echo ${n} > ${devdir}/sriov_numvfs'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable i915-sriov-vf.service
+        ok "已启用持久化服务 i915-sriov-vf.service"
+    fi
 }
 
-
-# --- 主函数 ---
+# --- 主流程 ---
 main() {
-    print_msg "$C_BLUE" "======================================================"
-    print_msg "$C_BLUE" "  Intel i915 SR-IOV 驱动一键安装脚本 v${SCRIPT_VERSION}"
-    print_msg "$C_BLUE" "  GitHub: https://github.com/iHub-2020/PVE_Utilities"
-    print_msg "$C_BLUE" "======================================================"
+    echo -e "${C_BLUE}======================================================${C_RESET}"
+    echo -e "${C_BLUE}  Intel i915 SR-IOV 驱动一键安装脚本 v${SCRIPT_VERSION}${C_RESET}"
+    echo -e "${C_BLUE}  GitHub: https://github.com/iHub-2020/PVE_Utilities${C_RESET}"
+    echo -e "${C_BLUE}======================================================${C_RESET}"
+
+    require_root
     
-    check_root
     check_dependencies
-    setup_backup_and_trap
-    
-    # 核心流程进化！
+    detect_environment
     fetch_latest_dkms_info
     fetch_supported_kernel_range
-    detect_environment
-    check_and_manage_kernel
+    collect_kernel_info
+
+    upgrade_kernel_if_needed
+    cleanup_old_kernels
     configure_kernel_params
-    install_dependencies_and_dkms
+    install_dkms_package
     configure_vf
-    
-    # 结束语
-    print_msg "$C_GREEN" "=========================================================================="
-    print_msg "$C_GREEN" "  恭喜！所有配置步骤已成功完成！"
-    print_msg "$C_YELLOW" "  重要：请务必重启系统以应用所有更改。"
-    print_msg "$C_GREEN" "=========================================================================="
-    
-    # ... (省略与上一版相同的清理逻辑)
-    trap - ERR
+
+    ok "所有配置步骤执行完毕。"
+    warn "强烈建议现在重启系统，以确保所有更改（内核、参数、模块、VF）完全生效。"
+    trap - ERR INT TERM
 }
 
-# --- 脚本入口 ---
 main "$@"
