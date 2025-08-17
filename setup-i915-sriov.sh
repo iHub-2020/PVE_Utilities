@@ -4,7 +4,7 @@
 # Script Name:   setup-i915-sriov.sh
 # Description:   一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
 # Author:        Optimized for iHub-2020
-# Version:       1.5.4 (修复 jq 过滤器中错误的转义字符)
+# Version:       1.5.5 (重写内核清理逻辑，防止误删当前内核及元数据包)
 # GitHub:        https://github.com/iHub-2020/PVE_Utilities
 # ===================================================================================
 
@@ -18,7 +18,7 @@ warn() { echo -e "${C_YELLOW}  [提示]${C_RESET} $1"; }
 fail() { echo -e "${C_RED}  [错误]${C_RESET} $1"; }
 
 # --- 全局变量与常量 ---
-readonly SCRIPT_VERSION="1.5.4"
+readonly SCRIPT_VERSION="1.5.5"
 readonly STATE_DIR="/var/tmp/i915-sriov-setup"
 readonly BACKUP_DIR="${STATE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -141,7 +141,6 @@ fetch_latest_dkms_info() {
     [[ -n "${GITHUB_TOKEN:-}" ]] && headers+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
 
     local json; json=$(curl -fsSL "${headers[@]}" "$api" || true)
-    # 【已修复】使用正确的双反斜杠 \\. 来转义 jq 正则表达式中的点
     DKMS_PACKAGE_URL=$(echo "$json" | jq -r '.assets[]?.browser_download_url | select(test("amd64\\.deb$"))' | head -n1)
 
     if [[ -z "${DKMS_PACKAGE_URL}" ]]; then
@@ -281,39 +280,59 @@ upgrade_kernel_if_needed() {
     exit 0
 }
 
-# --- 可选：清理旧内核 ---
+# --- 【已重写】可选：清理旧内核 ---
 cleanup_old_kernels() {
     step "检查是否需要清理旧内核"
-    mapfile -t installed_kernel_packages < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'pve-kernel-*' 'proxmox-kernel-*' 2>/dev/null | grep -v 'common' || true)
-    if [[ ${#installed_kernel_packages[@]} -lt 2 ]]; then ok "无需清理（已安装内核数量 < 2）。"; return; fi
+    # 只查找带明确版本号的内核镜像包，排除元数据包
+    mapfile -t installed_kernel_images < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'pve-kernel-*' 'proxmox-kernel-*' 2>/dev/null | grep -vE 'common|generic|amd64' || true)
+    if [[ ${#installed_kernel_images[@]} -lt 2 ]]; then
+        ok "无需清理（已安装的明确版本内核数量 < 2）。"
+        return
+    fi
 
     read -rp "  是否执行“仅保留当前运行内核（可选再保留最近一个）”的清理？[y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || { warn "跳过内核清理。"; return 0; }
 
     read -rp "  是否保留一个最近的旧内核作为回退？[y/N]: " keep_old
-    
-    local running_pkg; running_pkg=$(dpkg-query -S "/boot/vmlinuz-${CURRENT_KERNEL}" 2>/dev/null | cut -d: -f1 || true)
-    local keep_set=("$running_pkg")
-    
-    if [[ "$keep_old" =~ ^[Yy]$ ]]; then
-        local latest_old; latest_old=$(printf "%s\n" "${installed_kernel_packages[@]}" | grep -v "$running_pkg" | sort -V | tail -n 1)
-        [[ -n "$latest_old" ]] && keep_set+=("$latest_old")
-    fi
 
+    # 确定要保留的内核版本字符串
+    local running_version; running_version="$(uname -r)"
+    local keep_versions=("$running_version")
+
+    if [[ "$keep_old" =~ ^[Yy]$ ]]; then
+        # 找到版本最新的、但不是当前运行的那个内核包
+        local latest_old_image
+        latest_old_image=$(printf "%s\n" "${installed_kernel_images[@]}" | grep -v "$running_version" | sort -V | tail -n 1)
+        
+        if [[ -n "$latest_old_image" ]]; then
+            # 从包名中提取版本号
+            local old_version; old_version=$(echo "$latest_old_image" | sed -E 's/.*-(pve|amd64)$//' | sed -E 's/.*-//')
+            keep_versions+=("$old_version")
+        fi
+    fi
+    
     local to_remove=()
-    mapfile -t all_related_packages < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'linux-headers-*' 'pve-kernel-*' 'proxmox-kernel-*' 'pve-headers-*' 'proxmox-headers-*' 2>/dev/null | grep -v 'common' || true)
+    # 查找所有内核相关包（包括头文件），但排除元数据包
+    mapfile -t all_related_packages < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'linux-headers-*' 'pve-kernel-*' 'proxmox-kernel-*' 'pve-headers-*' 'proxmox-headers-*' 2>/dev/null | grep -vE 'common|generic|amd64' || true)
+    
     for pkg in "${all_related_packages[@]}"; do
-        local kernel_base_name; kernel_base_name=$(echo "$pkg" | sed -E 's/linux-(image|headers)-//; s/(pve|proxmox)-(kernel|headers)-//')
         local should_keep=0
-        for keep in "${keep_set[@]}"; do
-            if [[ "$keep" == *"$kernel_base_name"* ]]; then
-                should_keep=1; break
+        for ver in "${keep_versions[@]}"; do
+            # 如果包名包含我们要保留的版本号，就标记为保留
+            if [[ "$pkg" == *"$ver"* ]]; then
+                should_keep=1
+                break
             fi
         done
+        # 如果没被标记，就加入待删除列表
         (( should_keep == 0 )) && to_remove+=("$pkg")
     done
 
-    if [[ ${#to_remove[@]} -eq 0 ]]; then ok "未发现可清理的旧内核包。"; return; fi
+    if [[ ${#to_remove[@]} -eq 0 ]]; then
+        ok "未发现可清理的旧内核包。"
+        return
+    fi
+
     warn "将要移除以下内核相关包（不含保留项）:"
     printf '    - %s\n' "${to_remove[@]}"
     read -rp "  确认删除？[y/N]: " go
@@ -325,6 +344,7 @@ cleanup_old_kernels() {
         warn "取消清理旧内核。"
     fi
 }
+
 
 # --- 配置内核/模块参数 ---
 configure_kernel_params() {
