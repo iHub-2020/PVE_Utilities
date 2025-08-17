@@ -4,7 +4,7 @@
 # Script Name:   setup-i915-sriov.sh
 # Description:   一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
 # Author:        Optimized for iHub-2020
-# Version:       1.8.5 (真·终极版 - 修复硬编码内核版本，实现动态检测)
+# Version:       1.8.6 (真·终极版 - 增加环境自适应，区分PVE宿主机与VM)
 # GitHub:        https://github.com/iHub-2020/PVE_Utilities
 # ===================================================================================
 
@@ -19,7 +19,7 @@ fail() { echo -e "${C_RED}  [错误]${C_RESET} $1" >&2; }
 info() { echo -e "  [信息] $1" >&2; }
 
 # --- 全局变量 ---
-readonly SCRIPT_VERSION="1.8.5"
+readonly SCRIPT_VERSION="1.8.6"
 readonly STATE_DIR="/var/tmp/i915-sriov-setup"
 readonly BACKUP_DIR="${STATE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -161,21 +161,32 @@ upgrade_kernel_if_needed() {
     fi
     warn "当前内核 ${CURRENT_KERNEL} 过低！"
 
-    info "正在查找可用的最新 PVE 内核..."
-    local latest_pve_kernel_pkg
-    latest_pve_kernel_pkg=$(apt-cache search pve-kernel- | grep -oP 'pve-kernel-\d+\.\d+' | sort -V | tail -n 1 || true)
+    local kernel_pkg_to_install=""
+    local kernel_type_prompt=""
+
+    # 关键修复：判断运行环境
+    if cmd_exists pveversion; then
+        info "检测到 PVE 宿主机环境，将查找 PVE 内核..."
+        kernel_pkg_to_install=$(apt-cache search pve-kernel- | grep -oP 'pve-kernel-\d+\.\d+' | sort -V | tail -n 1 || true)
+        kernel_type_prompt="最新的 PVE 内核 ${kernel_pkg_to_install}"
+    else
+        info "检测到通用 Linux VM 环境，将查找标准内核..."
+        # 对于标准Debian/Ubuntu，通常使用元数据包来安装最新内核
+        kernel_pkg_to_install="linux-image-amd64"
+        kernel_type_prompt="最新的标准内核 (${kernel_pkg_to_install})"
+    fi
     
-    if [[ -z "$latest_pve_kernel_pkg" ]]; then
-        fail "无法自动找到可用的 PVE 内核包。请检查您的 PVE 软件源配置。"
+    if [[ -z "$kernel_pkg_to_install" ]]; then
+        fail "无法自动找到可用的内核包。请检查您的软件源配置。"
         exit 1
     fi
-    ok "找到最新的 PVE 内核包: ${latest_pve_kernel_pkg}"
+    ok "找到可用的内核包: ${kernel_pkg_to_install}"
 
-    read -rp "  是否自动升级到 ${latest_pve_kernel_pkg}？[y/N]: " ans
+    read -rp "  是否自动升级到${kernel_type_prompt}？[y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || { fail "用户取消内核升级。"; exit 1; }
     
     apt-get update -y
-    apt-get install -y "${latest_pve_kernel_pkg}"
+    apt-get install -y "${kernel_pkg_to_install}"
     warn "新内核已安装，脚本将退出。"
     fail "请重启系统进入新内核，然后再次运行本脚本！"
     exit 0
@@ -190,6 +201,7 @@ ensure_grub_params() {
     sed -i -E 's/^(GRUB_CMDLINE_LINUX_DEFAULT=")(.*)"/\1\2 intel_iommu=on iommu=pt"/' "$grub_file"
     
     update-grub
+    # 在非PVE环境下，这个命令会失败，所以加上 || true
     if cmd_exists proxmox-boot-tool; then proxmox-boot-tool refresh || true; fi
     ok "GRUB 配置更新完成。"
 }
@@ -205,7 +217,8 @@ write_modprobe_conf() {
 
 install_dkms_package() {
     info "正在安装内核头文件与 DKMS 包..."
-    apt-get install -y "pve-headers-${CURRENT_KERNEL}" || apt-get install -y "linux-headers-${CURRENT_KERNEL}" || warn "头文件自动安装失败。"
+    # 尝试安装与当前内核匹配的头文件，兼容PVE和通用内核
+    apt-get install -y "linux-headers-${CURRENT_KERNEL}" || warn "头文件自动安装失败，请手动安装。"
     
     local tmp_deb="/tmp/$(basename "$DKMS_INFO_URL")"
     curl -fSL "$DKMS_INFO_URL" -o "$tmp_deb"
