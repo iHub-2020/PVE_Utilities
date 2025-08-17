@@ -4,7 +4,7 @@
 # Script Name:   setup-i915-sriov.sh
 # Description:   一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
 # Author:        Optimized for iHub-2020
-# Version:       1.8.2 (终极踩坑修复版 - 修复致命的权限检查BUG)
+# Version:       1.8.3 (终极踩坑修复版 - 修复致命的jq转义兼容性BUG)
 # GitHub:        https://github.com/iHub-2020/PVE_Utilities
 # ===================================================================================
 
@@ -19,7 +19,7 @@ fail() { echo -e "${C_RED}  [错误]${C_RESET} $1"; }
 info() { echo -e "  [信息] $1"; }
 
 # --- 全局变量 ---
-readonly SCRIPT_VERSION="1.8.2"
+readonly SCRIPT_VERSION="1.8.3"
 readonly STATE_DIR="/var/tmp/i915-sriov-setup"
 readonly BACKUP_DIR="${STATE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -142,8 +142,11 @@ fetch_latest_dkms_info() {
     info "正在从 GitHub 获取最新驱动信息..."
     local api="https://api.github.com/repos/strongtz/i915-sriov-dkms/releases/latest"
     local json; json=$(curl -fsSL "$api" || true)
-    local url; url=$(echo "$json" | jq -r '.assets[]?.browser_download_url | select(test("amd64\.deb$"))' | head -n1)
-    [[ -z "$url" ]] && { fail "从 GitHub API 获取下载链接失败。"; exit 1; }
+    
+    # --- 关键修复：使用双反斜杠 \\. 来确保 jq 正确处理正则表达式 ---
+    local url; url=$(echo "$json" | jq -r '.assets[]?.browser_download_url | select(test("amd64\\.deb$"))' | head -n1)
+    
+    [[ -z "$url" ]] && { fail "从 GitHub API 获取下载链接失败。请检查网络或稍后再试。"; exit 1; }
     
     local kernel_ver; kernel_ver=$(echo "$json" | jq -r '.body' | sed -n -E 's/.*compat v([0-9]+\.[0-9]+).*/\1/p' | head -n1)
     [[ -z "$kernel_ver" ]] && kernel_ver="6.8" && warn "无法解析内核版本，默认使用 >= 6.8"
