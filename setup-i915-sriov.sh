@@ -4,7 +4,7 @@
 # Script Name:   setup-i915-sriov.sh
 # Description:   一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
 # Author:        Optimized for iHub-2020
-# Version:       1.5.5 (重写内核清理逻辑，防止误删当前内核及元数据包)
+# Version:       1.5.6 (再次重写内核清理逻辑，严格限定范围，杜绝误删)
 # GitHub:        https://github.com/iHub-2020/PVE_Utilities
 # ===================================================================================
 
@@ -18,7 +18,7 @@ warn() { echo -e "${C_YELLOW}  [提示]${C_RESET} $1"; }
 fail() { echo -e "${C_RED}  [错误]${C_RESET} $1"; }
 
 # --- 全局变量与常量 ---
-readonly SCRIPT_VERSION="1.5.5"
+readonly SCRIPT_VERSION="1.5.6"
 readonly STATE_DIR="/var/tmp/i915-sriov-setup"
 readonly BACKUP_DIR="${STATE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -283,8 +283,8 @@ upgrade_kernel_if_needed() {
 # --- 【已重写】可选：清理旧内核 ---
 cleanup_old_kernels() {
     step "检查是否需要清理旧内核"
-    # 只查找带明确版本号的内核镜像包，排除元数据包
-    mapfile -t installed_kernel_images < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'pve-kernel-*' 'proxmox-kernel-*' 2>/dev/null | grep -vE 'common|generic|amd64' || true)
+    # 只查找带明确版本号的内核镜像包
+    mapfile -t installed_kernel_images < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'pve-kernel-*' 'proxmox-kernel-*' 2>/dev/null | grep -E '[0-9]+\.[0-9]+\.[0-9]+' || true)
     if [[ ${#installed_kernel_images[@]} -lt 2 ]]; then
         ok "无需清理（已安装的明确版本内核数量 < 2）。"
         return
@@ -300,33 +300,33 @@ cleanup_old_kernels() {
     local keep_versions=("$running_version")
 
     if [[ "$keep_old" =~ ^[Yy]$ ]]; then
-        # 找到版本最新的、但不是当前运行的那个内核包
         local latest_old_image
         latest_old_image=$(printf "%s\n" "${installed_kernel_images[@]}" | grep -v "$running_version" | sort -V | tail -n 1)
-        
         if [[ -n "$latest_old_image" ]]; then
-            # 从包名中提取版本号
-            local old_version; old_version=$(echo "$latest_old_image" | sed -E 's/.*-(pve|amd64)$//' | sed -E 's/.*-//')
+            local old_version; old_version=$(echo "$latest_old_image" | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+[^[:space:]]*')
             keep_versions+=("$old_version")
         fi
     fi
     
     local to_remove=()
-    # 查找所有内核相关包（包括头文件），但排除元数据包
-    mapfile -t all_related_packages < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'linux-headers-*' 'pve-kernel-*' 'proxmox-kernel-*' 'pve-headers-*' 'proxmox-headers-*' 2>/dev/null | grep -vE 'common|generic|amd64' || true)
+    # 查找所有带明确版本号的内核相关包（包括头文件）
+    mapfile -t all_related_packages < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'linux-headers-*' 'pve-kernel-*' 'proxmox-kernel-*' 'pve-headers-*' 'proxmox-headers-*' 2>/dev/null | grep -E '[0-9]+\.[0-9]+\.[0-9]+' || true)
     
     for pkg in "${all_related_packages[@]}"; do
         local should_keep=0
         for ver in "${keep_versions[@]}"; do
-            # 如果包名包含我们要保留的版本号，就标记为保留
             if [[ "$pkg" == *"$ver"* ]]; then
                 should_keep=1
                 break
             fi
         done
-        # 如果没被标记，就加入待删除列表
         (( should_keep == 0 )) && to_remove+=("$pkg")
     done
+
+    # 单独处理没用的 32位 pae 头文件
+    if pkg_installed "linux-headers-686-pae"; then
+        to_remove+=("linux-headers-686-pae")
+    fi
 
     if [[ ${#to_remove[@]} -eq 0 ]]; then
         ok "未发现可清理的旧内核包。"
