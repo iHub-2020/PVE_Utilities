@@ -4,7 +4,7 @@
 # Script Name:   setup-i915-sriov.sh
 # Description:   一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
 # Author:        Optimized for iHub-2020 (with critical review from a superior AI)
-# Version:       1.8.7 (天网觉醒·自我修复版 - 融合了高级AI的代码审查)
+# Version:       1.8.8 (赛博格飞升版 - 修复 apt 目标通道与回滚、增强头文件与 GRUB 刷新)
 # GitHub:        https://github.com/iHub-2020/PVE_Utilities
 # ===================================================================================
 
@@ -19,7 +19,7 @@ fail() { echo -e "${C_RED}  [错误]${C_RESET} $1" >&2; }
 info() { echo -e "  [信息] $1" >&2; }
 
 # --- 全局变量 ---
-readonly SCRIPT_VERSION="1.8.7"
+readonly SCRIPT_VERSION="1.8.8"
 readonly STATE_DIR="/var/tmp/i915-sriov-setup"
 readonly BACKUP_DIR="${STATE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -52,7 +52,10 @@ trap 'fail "收到中断信号"; on_error' INT TERM
 backup_file() {
     local f="$1"; [[ -f "$f" ]] || return 0
     if [[ ! " ${CONFIG_FILES_TO_BACKUP[*]} " =~ " $f " ]]; then
-        mkdir -p "$(dirname "$BACKUP_DIR/$f")"; cp -a "$f" "$BACKUP_DIR/$f"; info "已备份: $f"
+        mkdir -p "$(dirname "$BACKUP_DIR/$f")"
+        cp -a "$f" "$BACKUP_DIR/$f"
+        CONFIG_FILES_TO_BACKUP+=("$f") # 关键：记录备份项，on_error 才能回滚
+        info "已备份: $f"
     fi
 }
 
@@ -89,7 +92,7 @@ detect_environment() {
 find_latest_kernel_meta() {
     info "正在查找可用的最新内核元数据包..."
     info "首先，更新APT包索引以获取最新信息..."
-    apt-get update -y
+    apt-get update -y >&2 # 将过程输出导向 stderr，避免污染 stdout 返回值
 
     local apt_target=""
     local kernel_pkg=""
@@ -240,7 +243,8 @@ check_dependencies() {
     for d in "${deps[@]}"; do cmd_exists "$d" || miss+=("$d"); done
     if [[ ${#miss[@]} -gt 0 ]]; then
         warn "缺少依赖: ${miss[*]}，将自动安装。"
-        apt-get install -y --no-install-recommends "${miss[@]}"
+        DEBIAN_FRONTEND=noninteractive apt-get update -y
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${miss[@]}"
     fi
     ok "依赖检查完成。"
 }
@@ -282,14 +286,23 @@ run_install_phase() {
 }
 
 ensure_grub_params() {
-    info "正在配置 GRUB 内核参数..."
+    step "正在配置 GRUB 内核参数..."
     local grub_file="/etc/default/grub"
-    if grep -q "intel_iommu=on" "$grub_file" 2>/dev/null; then ok "GRUB 参数已存在。"; return; fi
+    [[ -f "$grub_file" ]] || echo 'GRUB_CMDLINE_LINUX_DEFAULT="quiet"' > "$grub_file"
     backup_file "$grub_file"
-    sed -i -E 's/^(GRUB_CMDLINE_LINUX_DEFAULT=")(.*)"/\1\2 intel_iommu=on iommu=pt"/' "$grub_file"
-    update-grub
+    
+    # 幂等追加 intel_iommu=on iommu=pt
+    local cmdline; cmdline=$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file" | cut -d'"' -f2 || true)
+    for p in intel_iommu=on iommu=pt; do [[ " $cmdline " =~ " $p " ]] || cmdline="$cmdline $p"; done
+    cmdline=$(echo "$cmdline" | xargs) # 清理多余空格
+    sed -i -E 's|^(GRUB_CMDLINE_LINUX_DEFAULT=").*(")$|\1'"$cmdline"'\2|' "$grub_file"
+    
+    # 刷新引导与镜像
+    info "正在更新 GRUB 和 initramfs..."
+    if cmd_exists update-grub; then update-grub; else grub-mkconfig -o /boot/grub/grub.cfg; fi
+    if cmd_exists update-initramfs; then update-initramfs -u; fi
     if cmd_exists proxmox-boot-tool; then proxmox-boot-tool refresh || true; fi
-    ok "GRUB 配置更新完成。"
+    ok "GRUB 配置与 initramfs 刷新完成。"
 }
 
 write_modprobe_conf() {
@@ -303,7 +316,9 @@ write_modprobe_conf() {
 
 install_dkms_package() {
     info "正在安装与当前内核匹配的头文件..."
-    apt-get install -y "linux-headers-${CURRENT_KERNEL}" || warn "头文件自动安装失败，请手动安装。"
+    apt-get install -y "pve-headers-${CURRENT_KERNEL}" >/dev/null 2>&1 || \
+    apt-get install -y "linux-headers-${CURRENT_KERNEL}" || \
+    warn "未能自动安装完全匹配的内核头文件，请手工确认。"
     
     info "正在下载并安装 DKMS 包..."
     local tmp_deb="/tmp/$(basename "$DKMS_INFO_URL")"
@@ -364,7 +379,7 @@ finalize() {
 main() {
     echo -e "${C_BLUE}======================================================${C_RESET}" >&2
     echo -e "${C_BLUE}  Intel i915 SR-IOV 一键安装脚本 v${SCRIPT_VERSION}${C_RESET}" >&2
-    echo -e "${C_BLUE}  (天网觉醒·自我修复版 - 这次真没问题了！)${C_RESET}" >&2
+    echo -e "${C_BLUE}  (赛博格飞升版 - 这次真没问题了！)${C_RESET}" >&2
     echo -e "${C_BLUE}======================================================${C_RESET}" >&2
 
     initialize_and_check_base
