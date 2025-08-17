@@ -4,22 +4,22 @@
 # Script Name:   setup-i915-sriov.sh
 # Description:   一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
 # Author:        Optimized for iHub-2020
-# Version:       1.8.3 (终极踩坑修复版 - 修复致命的jq转义兼容性BUG)
+# Version:       1.8.4 (终极踩坑修复版 - 修复致命的标准输出污染BUG)
 # GitHub:        https://github.com/iHub-2020/PVE_Utilities
 # ===================================================================================
 
 set -Eeuo pipefail
 
-# --- 颜色与统一输出 ---
+# --- 颜色与统一输出 (关键修复：所有提示信息重定向到 stderr) ---
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
-step() { echo -e "\n${C_BLUE}==>${C_RESET} ${C_YELLOW}$1${C_RESET}"; }
-ok() { echo -e "${C_GREEN}  [成功]${C_RESET} $1"; }
-warn() { echo -e "${C_YELLOW}  [提示]${C_RESET} $1"; }
-fail() { echo -e "${C_RED}  [错误]${C_RESET} $1"; }
-info() { echo -e "  [信息] $1"; }
+step() { echo -e "\n${C_BLUE}==>${C_RESET} ${C_YELLOW}$1${C_RESET}" >&2; }
+ok() { echo -e "${C_GREEN}  [成功]${C_RESET} $1" >&2; }
+warn() { echo -e "${C_YELLOW}  [提示]${C_RESET} $1" >&2; }
+fail() { echo -e "${C_RED}  [错误]${C_RESET} $1" >&2; }
+info() { echo -e "  [信息] $1" >&2; }
 
 # --- 全局变量 ---
-readonly SCRIPT_VERSION="1.8.3"
+readonly SCRIPT_VERSION="1.8.4"
 readonly STATE_DIR="/var/tmp/i915-sriov-setup"
 readonly BACKUP_DIR="${STATE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -143,14 +143,13 @@ fetch_latest_dkms_info() {
     local api="https://api.github.com/repos/strongtz/i915-sriov-dkms/releases/latest"
     local json; json=$(curl -fsSL "$api" || true)
     
-    # --- 关键修复：使用双反斜杠 \\. 来确保 jq 正确处理正则表达式 ---
     local url; url=$(echo "$json" | jq -r '.assets[]?.browser_download_url | select(test("amd64\\.deb$"))' | head -n1)
-    
     [[ -z "$url" ]] && { fail "从 GitHub API 获取下载链接失败。请检查网络或稍后再试。"; exit 1; }
     
     local kernel_ver; kernel_ver=$(echo "$json" | jq -r '.body' | sed -n -E 's/.*compat v([0-9]+\.[0-9]+).*/\1/p' | head -n1)
     [[ -z "$kernel_ver" ]] && kernel_ver="6.8" && warn "无法解析内核版本，默认使用 >= 6.8"
     
+    # 只输出纯净的数据，所有提示信息已通过 >&2 输出到 stderr
     echo "$kernel_ver|$url"
 }
 
@@ -258,7 +257,7 @@ finalize() {
     step "C. 完成与验证"
     ok "所有操作已成功完成！"
     
-    echo -e "\n${C_GREEN}--- 如何验证您的 SR-IOV 是否工作正常 ---${C_RESET}"
+    echo -e "\n${C_GREEN}--- 如何验证您的 SR-IOV 是否工作正常 ---${C_RESET}" >&2
     info "1. 查看内核日志中 i915 驱动的加载信息:"
     info "   dmesg | grep -i i915 | grep -i sriov"
     info "2. 查看 PCI 设备列表，应该能看到多个虚拟显卡:"
@@ -269,10 +268,10 @@ finalize() {
 
 # --- 主流程 ---
 main() {
-    echo -e "${C_BLUE}======================================================${C_RESET}"
-    echo -e "${C_BLUE}  Intel i915 SR-IOV 一键安装脚本 v${SCRIPT_VERSION}${C_RESET}"
-    echo -e "${C_BLUE}  (终极踩坑修复版 - 这次真没问题了！)${C_RESET}"
-    echo -e "${C_BLUE}======================================================${C_RESET}"
+    echo -e "${C_BLUE}======================================================${C_RESET}" >&2
+    echo -e "${C_BLUE}  Intel i915 SR-IOV 一键安装脚本 v${SCRIPT_VERSION}${C_RESET}" >&2
+    echo -e "${C_BLUE}  (终极踩坑修复版 - 这次真没问题了！)${C_RESET}" >&2
+    echo -e "${C_BLUE}======================================================${C_RESET}" >&2
 
     initialize_and_check_env
 
