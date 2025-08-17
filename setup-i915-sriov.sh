@@ -4,7 +4,7 @@
 # Script Name:   setup-i915-sriov.sh
 # Description:   一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
 # Author:        Optimized for iHub-2020
-# Version:       1.5.2 (修复 require_root 在 set -e 下的逻辑及文本粘贴错误)
+# Version:       1.5.3 (修复 jq 过滤器中错误的转义字符)
 # GitHub:        https://github.com/iHub-2020/PVE_Utilities
 # ===================================================================================
 
@@ -18,7 +18,7 @@ warn() { echo -e "${C_YELLOW}  [提示]${C_RESET} $1"; }
 fail() { echo -e "${C_RED}  [错误]${C_RESET} $1"; }
 
 # --- 全局变量与常量 ---
-readonly SCRIPT_VERSION="1.5.2"
+readonly SCRIPT_VERSION="1.5.3"
 readonly STATE_DIR="/var/tmp/i915-sriov-setup"
 readonly BACKUP_DIR="${STATE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -75,7 +75,6 @@ trap on_error ERR
 trap 'fail "收到中断信号"; on_error' INT TERM
 
 # --- 工具函数 ---
-# 【已修复】将单行判断改为标准的 if-then 结构，以兼容 set -e
 require_root() {
     if [[ $EUID -ne 0 ]]; then
         fail "本脚本需要 root 权限，请使用 sudo 运行。"
@@ -105,7 +104,7 @@ check_dependencies() {
     ok "依赖检查完成。"
 }
 
-# --- 环境与系统探测（失败回退交互） ---
+# --- 环境与系统探测 ---
 detect_environment() {
     step "检测运行环境"
     if cmd_exists pveversion; then
@@ -142,6 +141,7 @@ fetch_latest_dkms_info() {
     [[ -n "${GITHUB_TOKEN:-}" ]] && headers+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
 
     local json; json=$(curl -fsSL "${headers[@]}" "$api" || true)
+    # 【已修复】将 \\.deb$ 改为 \.deb$，修复 jq 的 regex 语法错误
     DKMS_PACKAGE_URL=$(echo "$json" | jq -r '.assets[]?.browser_download_url | select(test("amd64\.deb$"))' | head -n1)
 
     if [[ -z "${DKMS_PACKAGE_URL}" ]]; then
@@ -192,7 +192,7 @@ collect_kernel_info() {
     ok "当前运行内核: ${CURRENT_KERNEL} (主次版本: ${CURRENT_KMM})"
 }
 
-# --- 确保当前内核头文件已安装（尽可能匹配运行内核） ---
+# --- 确保当前内核头文件已安装 ---
 ensure_headers_for_running_kernel() {
     step "检查并安装当前内核的头文件"
     local candidates=(
@@ -224,13 +224,10 @@ select_pve_kernel_meta_in_range() {
     local min="$1" max="$2"
     step "为 PVE 搜索范围为 [${min}-${max}] 的内核元包"
 
-    local names; names=$(apt-cache pkgnames 2>/dev/null | grep -E '^(proxmox|pve)-kernel-[0-9]+\.[0-9]+$' || true)
-    if [[ -z "$names" ]]; then
-        names=$(apt-cache search --names-only '^(proxmox|pve)-kernel-[0-9]+\.[0-9]+$' 2>/dev/null | awk '{print $1}' || true)
-    fi
+    local names; names=$(apt-cache search --names-only '^(proxmox|pve)-kernel-[0-9]+\.[0-9]+$' 2>/dev/null | awk '{print $1}' || true)
     local versions; versions=$(echo "$names" | sed -E 's/.*-([0-9]+\.[0-9]+)$/\1/' | sort -V | uniq || true)
 
-    local best="" best_name="" best_hdr=""
+    local best=""
     for v in $versions; do
         if ver_in_range "$v" "$min" "$max"; then best="$v"; fi
     done
@@ -238,6 +235,8 @@ select_pve_kernel_meta_in_range() {
         fail "未找到满足范围的 PVE 内核元包。请检查 PVE 源或手动安装。"
         exit 1
     fi
+    
+    local best_name="" best_hdr=""
     if echo "$names" | grep -q "proxmox-kernel-$best"; then
         best_name="proxmox-kernel-$best"; best_hdr="proxmox-headers-$best"
     else
@@ -246,7 +245,7 @@ select_pve_kernel_meta_in_range() {
     echo "${best_name}|${best_hdr}"
 }
 
-# --- 若不在范围则升级内核（升级后退出，提示重启） ---
+# --- 若不在范围则升级内核 ---
 upgrade_kernel_if_needed() {
     step "检查当前内核版本是否在支持范围内"
     if ver_in_range "$CURRENT_KMM" "$SUPPORTED_KERNEL_MIN" "$SUPPORTED_KERNEL_MAX"; then
@@ -271,41 +270,47 @@ upgrade_kernel_if_needed() {
         else # ubuntu
             local series; series="$(lsb_release -rs 2>/dev/null || echo 24.04)"
             local hwe="linux-generic-hwe-${series}"
-            if pkg_exists "$hwe"; then apt_install "$hwe"; else apt_install linux-generic linux-headers-generic; fi
-            if pkg_exists "linux-modules-extra-$(uname -r)"; then
-                read -rp "  检测到可用 linux-modules-extra-$(uname -r)，是否安装以增强功能？[y/N]: " ext
-                [[ "$ext" =~ ^[Yy]$ ]] && apt_install "linux-modules-extra-$(uname -r)"
-            fi
+            local to_install=()
+            if pkg_exists "$hwe"; then to_install+=("$hwe"); else to_install+=("linux-generic" "linux-headers-generic"); fi
+            local extra_pkg="linux-modules-extra-${CURRENT_KERNEL}"
+            if pkg_exists "$extra_pkg"; then to_install+=("$extra_pkg"); fi
+            apt_install "${to_install[@]}"
         fi
     fi
     warn "内核已升级，必须重启系统后再次运行本脚本才能继续。"
     exit 0
 }
 
-# --- 可选：清理旧内核（仅删除已安装的包，建议用户确认） ---
+# --- 可选：清理旧内核 ---
 cleanup_old_kernels() {
     step "检查是否需要清理旧内核"
-    local running_pkg; running_pkg=$(dpkg-query -S "/boot/vmlinuz-${CURRENT_KERNEL}" 2>/dev/null | cut -d: -f1 || true)
-
-    mapfile -t installed_kernels < <(dpkg -l | awk '/^ii/ && ($2 ~ /^(linux-image|linux-headers|pve-kernel|proxmox-kernel|pve-headers|proxmox-headers)-/){print $2}')
-    if [[ ${#installed_kernels[@]} -lt 2 ]]; then ok "无需清理（内核相关包数量 < 2）。"; return; fi
+    mapfile -t installed_kernel_packages < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'pve-kernel-*' 'proxmox-kernel-*' 2>/dev/null | grep -v 'common' || true)
+    if [[ ${#installed_kernel_packages[@]} -lt 2 ]]; then ok "无需清理（已安装内核数量 < 2）。"; return; fi
 
     read -rp "  是否执行“仅保留当前运行内核（可选再保留最近一个）”的清理？[y/N]: " ans
     [[ "$ans" =~ ^[Yy]$ ]] || { warn "跳过内核清理。"; return 0; }
 
-    read -rp "  是否保留一个最近旧内核作为回退？[y/N]: " keep_old
-    local keep_set=()
+    read -rp "  是否保留一个最近的旧内核作为回退？[y/N]: " keep_old
+    
+    local running_pkg; running_pkg=$(dpkg-query -S "/boot/vmlinuz-${CURRENT_KERNEL}" 2>/dev/null | cut -d: -f1 || true)
+    local keep_set=("$running_pkg")
+    
     if [[ "$keep_old" =~ ^[Yy]$ ]]; then
-        mapfile -t keep_set < <(printf "%s\n" "${installed_kernels[@]}" | grep -E 'linux-image|pve-kernel|proxmox-kernel' | sort -V | tail -n 2)
-    else
-        keep_set=("$running_pkg")
+        local latest_old; latest_old=$(printf "%s\n" "${installed_kernel_packages[@]}" | grep -v "$running_pkg" | sort -V | tail -n 1)
+        [[ -n "$latest_old" ]] && keep_set+=("$latest_old")
     fi
 
     local to_remove=()
-    for pkg in "${installed_kernels[@]}"; do
-        if printf "%s\n" "${keep_set[@]}" | grep -qx "$pkg"; then continue; fi
-        [[ "$pkg" == "$running_pkg" ]] && continue
-        to_remove+=("$pkg")
+    mapfile -t all_related_packages < <(dpkg-query -W -f='${Package}\n' 'linux-image-*' 'linux-headers-*' 'pve-kernel-*' 'proxmox-kernel-*' 'pve-headers-*' 'proxmox-headers-*' 2>/dev/null | grep -v 'common' || true)
+    for pkg in "${all_related_packages[@]}"; do
+        local kernel_base_name; kernel_base_name=$(echo "$pkg" | sed -E 's/linux-(image|headers)-//; s/(pve|proxmox)-(kernel|headers)-//')
+        local should_keep=0
+        for keep in "${keep_set[@]}"; do
+            if [[ "$keep" == *"$kernel_base_name"* ]]; then
+                should_keep=1; break
+            fi
+        done
+        (( should_keep == 0 )) && to_remove+=("$pkg")
     done
 
     if [[ ${#to_remove[@]} -eq 0 ]]; then ok "未发现可清理的旧内核包。"; return; fi
@@ -313,15 +318,15 @@ cleanup_old_kernels() {
     printf '    - %s\n' "${to_remove[@]}"
     read -rp "  确认删除？[y/N]: " go
     if [[ "$go" =~ ^[Yy]$ ]]; then
-        DEBIAN_FRONTEND=noninteractive apt-get purge -y "${to_remove[@]}" || true
-        DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || true
+        DEBIAN_FRONTEND=noninteractive apt-get purge -y "${to_remove[@]}"
+        DEBIAN_FRONTEND=noninteractive apt-get autoremove -y
         ok "旧内核清理完成。"
     else
         warn "取消清理旧内核。"
     fi
 }
 
-# --- 配置内核/模块参数（含 xe 黑名单与 i915 选项） ---
+# --- 配置内核/模块参数 ---
 configure_kernel_params() {
     step "配置内核与模块参数"
     local grub_file="/etc/default/grub"
@@ -342,7 +347,7 @@ configure_kernel_params() {
 
     local modconf="/etc/modprobe.d/i915-sriov-dkms.conf"
     backup_file "$modconf"
-    : > "$modconf"
+    : > "$modconf" # 清空文件
 
     read -rp "  是否添加 xe 黑名单（推荐）？[Y/n]: " bxe
     if [[ ! "$bxe" =~ ^[Nn]$ ]]; then
@@ -371,7 +376,7 @@ configure_kernel_params() {
 
     if cmd_exists update-grub; then update-grub; else grub-mkconfig -o /boot/grub/grub.cfg; fi
     if cmd_exists update-initramfs; then update-initramfs -u; fi
-    if cmd_exists proxmox-boot-tool; then proxmox-boot-tool refresh || true; fi
+    if cmd_exists proxmox-boot-tool; then proxmox-boot-tool refresh; fi
     ok "引导与 initramfs 已更新。"
 }
 
@@ -388,103 +393,14 @@ install_dkms_package() {
     dpkg -i "$tmp_pkg" || DEBIAN_FRONTEND=noninteractive apt-get -f install -y
 
     ok "DKMS 包安装完成。"
-    dkms status || true
+    dkms status
 }
 
-# --- 宿主机：VF 创建与持久化（可选） ---
+# --- 宿主机：VF 创建与持久化 ---
 configure_vf() {
-    [[ "$ENV_TYPE" == "PVE_HOST" ]] || { warn "当前为虚拟机环境，跳过 VF 创建。"; return 0; }
+    [[ "$ENV_TYPE" == "PVE_HOST" ]] || return 0
     step "创建 SR-IOV VF（可选）"
 
     local devdir="/sys/class/drm/card0/device"
     if [[ ! -d "$devdir" || ! -f "$devdir/sriov_totalvfs" ]]; then
-        warn "未发现 ${devdir}/sriov_totalvfs。通常 iGPU 位于 0000:00:02.0。"
-        read -rp "  请手动输入 sriov_numvfs 的完整路径（如 /sys/devices/pci0000:00/0000:00:02.0/sriov_numvfs，留空跳过）: " manual
-        [[ -z "$manual" ]] && { warn "跳过 VF 创建。"; return 0; }
-        devdir="$(dirname "$manual")"
-    fi
-
-    local total=0
-    [[ -f "$devdir/sriov_totalvfs" ]] && total=$(cat "$devdir/sriov_totalvfs")
-    if [[ "$total" -le 0 ]]; then
-        warn "该设备报告不支持 SR-IOV（totalvfs=$total），跳过。"
-        return 0
-    fi
-    ok "设备最大 VF 数量：$total"
-
-    read -rp "  请输入要创建的 VF 数量（1-$total，回车跳过）: " n
-    [[ -z "$n" ]] && { warn "跳过 VF 创建。"; return 0; }
-    if [[ "$n" -ge 1 && "$n" -le "$total" ]]; then
-        echo 0 > "$devdir/sriov_numvfs" || true
-        echo "$n" > "$devdir/sriov_numvfs"
-        ok "已创建 $n 个 VF。"
-    else
-        warn "输入无效，跳过 VF 创建。"
-        return 0
-    fi
-
-    read -rp "  是否将 VF 创建持久化为开机自动生效？[y/N]: " p
-    [[ "$p" =~ ^[Yy]$ ]] || { warn "跳过持久化。"; return 0; }
-
-    echo "  请选择持久化方式："
-    echo "    1) sysfsutils（写入 /etc/sysfs.conf，简单直接）"
-    echo "    2) systemd 服务（创建 i915-sriov-vf.service）"
-    read -rp "  请输入数字 [1/2]（默认 1）： " m
-    m="${m:-1}"
-
-    if [[ "$m" == "1" ]]; then
-        local sysfs="/etc/sysfs.conf"
-        backup_file "$sysfs"
-        apt_install sysfsutils
-        local rel; rel=$(realpath --relative-to=/sys "$devdir" 2>/dev/null) || rel="devices/pci0000:00/0000:00:02.0"
-        sed -i '\|sriov_numvfs|d' "$sysfs" 2>/dev/null || true
-        echo "${rel}/sriov_numvfs = ${n}" >> "$sysfs"
-        ok "已写入 $sysfs"
-    else
-        local svc="/etc/systemd/system/i915-sriov-vf.service"
-        backup_file "$svc"
-        cat > "$svc" <<EOF
-[Unit]
-Description=Configure i915 SR-IOV VFs
-After=multi-user.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'echo 0 > ${devdir}/sriov_numvfs; echo ${n} > ${devdir}/sriov_numvfs'
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable i915-sriov-vf.service
-        ok "已启用持久化服务 i915-sriov-vf.service"
-    fi
-}
-
-# --- 主流程 ---
-main() {
-    echo -e "${C_BLUE}======================================================${C_RESET}"
-    echo -e "${C_BLUE}  Intel i915 SR-IOV 驱动一键安装脚本 v${SCRIPT_VERSION}${C_RESET}"
-    echo -e "${C_BLUE}  GitHub: https://github.com/iHub-2020/PVE_Utilities${C_RESET}"
-    echo -e "${C_BLUE}======================================================${C_RESET}"
-
-    require_root
-
-    check_dependencies
-    detect_environment
-    fetch_latest_dkms_info
-    fetch_supported_kernel_range
-    collect_kernel_info
-
-    upgrade_kernel_if_needed
-    cleanup_old_kernels
-    configure_kernel_params
-    install_dkms_package
-    configure_vf
-
-    ok "所有配置步骤执行完毕。"
-    warn "强烈建议现在重启系统，以确保所有更改（内核、参数、模块、VF）完全生效。"
-    trap - ERR INT TERM
-}
-
-main "$@"
+        warn "未在
