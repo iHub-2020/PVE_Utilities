@@ -4,13 +4,13 @@
 # Script Name:   setup-i915-sriov.sh
 # Description:   一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
 # Author:        Optimized for iHub-2020
-# Version:       1.8.0 (人类架构 + AI细节优化 = 终极形态)
+# Version:       1.8.2 (终极踩坑修复版 - 修复致命的权限检查BUG)
 # GitHub:        https://github.com/iHub-2020/PVE_Utilities
 # ===================================================================================
 
 set -Eeuo pipefail
 
-# --- 颜色与统一输出 (采纳自 AI v1.6.1) ---
+# --- 颜色与统一输出 ---
 C_RESET='\033[0m'; C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[0;33m'; C_BLUE='\033[0;34m'
 step() { echo -e "\n${C_BLUE}==>${C_RESET} ${C_YELLOW}$1${C_RESET}"; }
 ok() { echo -e "${C_GREEN}  [成功]${C_RESET} $1"; }
@@ -19,7 +19,7 @@ fail() { echo -e "${C_RED}  [错误]${C_RESET} $1"; }
 info() { echo -e "  [信息] $1"; }
 
 # --- 全局变量 ---
-readonly SCRIPT_VERSION="1.8.0"
+readonly SCRIPT_VERSION="1.8.2"
 readonly STATE_DIR="/var/tmp/i915-sriov-setup"
 readonly BACKUP_DIR="${STATE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -27,7 +27,7 @@ IGPU_PCI_ADDR=""; IGPU_DEV_PATH=""; CURRENT_KERNEL=""; DKMS_INFO_URL=""
 VF_CONTROL_FILE_EXISTS=false; DKMS_INSTALLED=false
 CONFIG_FILES_TO_BACKUP=()
 
-# --- 增强版错误处理与回滚 (采纳自 AI v1.6.1) ---
+# --- 增强版错误处理与回滚 ---
 on_error() {
     local code=$?
     local line="${BASH_LINENO[0]:-?}"
@@ -54,21 +54,25 @@ backup_file() {
     if [[ ! " ${CONFIG_FILES_TO_BACKUP[*]} " =~ " $f " ]]; then
         mkdir -p "$(dirname "$BACKUP_DIR/$f")"
         cp -a "$f" "$BACKUP_DIR/$f"
-        CONFIG_FILES_TO_BACKUP+=("$f")
         info "已备份: $f"
     fi
 }
 
-# --- 工具函数 (部分采纳自 AI v1.6.1) ---
-require_root() { [[ $EUID -ne 0 ]] && { fail "本脚本需要 root 权限。"; exit 1; }; }
+# --- 工具函数 ---
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        fail "本脚本需要 root 权限，请使用 sudo 运行或直接以 root 用户执行。"
+        exit 1
+    fi
+}
 cmd_exists() { command -v "$1" &>/dev/null; }
 pkg_installed(){ dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"; }
 ver_ge() { dpkg --compare-versions "$1" ge "$2"; }
 
-# --- 核心功能模块 (人类架构 + AI细节) ---
+# --- 核心功能模块 ---
 
 check_dependencies() {
-    step "1. 检查并安装依赖 (采纳自 AI v1.6.1)"
+    step "1. 检查并安装依赖"
     local deps=(curl jq dkms build-essential pciutils lsb-release)
     local miss=()
     for d in "${deps[@]}"; do cmd_exists "$d" || miss+=("$d"); done
@@ -86,7 +90,6 @@ initialize_and_check_env() {
     CURRENT_KERNEL=$(uname -r)
     info "当前运行内核: ${CURRENT_KERNEL}"
 
-    # 增强版硬件探测 (采纳自 AI v1.6.1)
     local line
     line="$(lspci -D -nn 2>/dev/null | grep -Ei 'VGA compatible controller|Display controller|3D controller' | grep -i 'Intel' || true)"
     IGPU_PCI_ADDR="$(echo "$line" | awk '{print $1}' | head -n1 || true)"
@@ -98,21 +101,19 @@ initialize_and_check_env() {
     IGPU_DEV_PATH="/sys/bus/pci/devices/${IGPU_PCI_ADDR}"
     ok "检测到核显设备: ${IGPU_PCI_ADDR}"
 
-    # 检查驱动激活状态
     if [[ -f "${IGPU_DEV_PATH}/sriov_numvfs" ]]; then
         VF_CONTROL_FILE_EXISTS=true
         info "SR-IOV 驱动已激活。"
     else
         info "SR-IOV 驱动未激活。"
     fi
-    # 检查DKMS包安装状态
     if cmd_exists dkms && dkms status 2>/dev/null | grep -q 'i915-sriov-dkms.*installed'; then
         DKMS_INSTALLED=true
         info "i915-sriov-dkms 包已安装。"
     fi
 }
 
-# --- 安装阶段核心逻辑 (人类架构) ---
+# --- 安装阶段核心逻辑 ---
 run_install_phase() {
     step "A. 安装阶段"
     if [[ "$DKMS_INSTALLED" == true ]]; then
@@ -123,13 +124,11 @@ run_install_phase() {
     
     check_dependencies
     
-    # 智能内核管理 (我的核心逻辑)
     local dkms_info; dkms_info=$(fetch_latest_dkms_info)
     DKMS_INFO_URL="${dkms_info#*|}"
     local supported_kernel; supported_kernel=$(echo "$dkms_info" | cut -d'|' -f1)
     upgrade_kernel_if_needed "$supported_kernel"
 
-    # 专业级系统配置 (采纳自 AI v1.6.1)
     ensure_grub_params
     write_modprobe_conf
     install_dkms_package
@@ -265,20 +264,18 @@ finalize() {
     info "   ls -l ${IGPU_DEV_PATH}/sriov_numvfs"
 }
 
-# --- 主流程 (清晰的状态机) ---
+# --- 主流程 ---
 main() {
     echo -e "${C_BLUE}======================================================${C_RESET}"
     echo -e "${C_BLUE}  Intel i915 SR-IOV 一键安装脚本 v${SCRIPT_VERSION}${C_RESET}"
-    echo -e "${C_BLUE}  (人类架构 + AI细节优化 = 终极形态)${C_RESET}"
+    echo -e "${C_BLUE}  (终极踩坑修复版 - 这次真没问题了！)${C_RESET}"
     echo -e "${C_BLUE}======================================================${C_RESET}"
 
     initialize_and_check_env
 
     if [[ "$VF_CONTROL_FILE_EXISTS" == true ]]; then
-        # 状态2: 驱动已激活，直接进入配置阶段
         run_configure_phase
     else
-        # 状态1: 驱动未激活，进入安装阶段
         run_install_phase
     fi
     
