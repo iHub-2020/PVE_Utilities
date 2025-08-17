@@ -4,7 +4,7 @@
 # Script Name:   setup-i915-sriov.sh
 # Description:   一键在 PVE 宿主机或其 Linux 虚拟机中安装 Intel i915 SR-IOV 驱动。
 # Author:        Optimized for iHub-2020
-# Version:       1.5.3 (修复 jq 过滤器中错误的转义字符)
+# Version:       1.5.4 (修复 jq 过滤器中错误的转义字符)
 # GitHub:        https://github.com/iHub-2020/PVE_Utilities
 # ===================================================================================
 
@@ -18,7 +18,7 @@ warn() { echo -e "${C_YELLOW}  [提示]${C_RESET} $1"; }
 fail() { echo -e "${C_RED}  [错误]${C_RESET} $1"; }
 
 # --- 全局变量与常量 ---
-readonly SCRIPT_VERSION="1.5.3"
+readonly SCRIPT_VERSION="1.5.4"
 readonly STATE_DIR="/var/tmp/i915-sriov-setup"
 readonly BACKUP_DIR="${STATE_DIR}/backup_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$STATE_DIR" "$BACKUP_DIR"
@@ -141,8 +141,8 @@ fetch_latest_dkms_info() {
     [[ -n "${GITHUB_TOKEN:-}" ]] && headers+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
 
     local json; json=$(curl -fsSL "${headers[@]}" "$api" || true)
-    # 【已修复】将 \\.deb$ 改为 \.deb$，修复 jq 的 regex 语法错误
-    DKMS_PACKAGE_URL=$(echo "$json" | jq -r '.assets[]?.browser_download_url | select(test("amd64\.deb$"))' | head -n1)
+    # 【已修复】使用正确的双反斜杠 \\. 来转义 jq 正则表达式中的点
+    DKMS_PACKAGE_URL=$(echo "$json" | jq -r '.assets[]?.browser_download_url | select(test("amd64\\.deb$"))' | head -n1)
 
     if [[ -z "${DKMS_PACKAGE_URL}" ]]; then
         fail "自动获取 .deb 下载地址失败（可能是网络或 API 限制）。"
@@ -403,4 +403,93 @@ configure_vf() {
 
     local devdir="/sys/class/drm/card0/device"
     if [[ ! -d "$devdir" || ! -f "$devdir/sriov_totalvfs" ]]; then
-        warn "未在
+        warn "未在默认路径 ${devdir} 发现 SR-IOV 接口。"
+        read -rp "  请手动输入 iGPU 的 PCI 地址（如 0000:00:02.0，留空跳过）: " pci_addr
+        [[ -z "$pci_addr" ]] && { warn "跳过 VF 创建。"; return 0; }
+        devdir="/sys/bus/pci/devices/$pci_addr"
+        if [[ ! -d "$devdir" ]]; then fail "提供的路径无效，跳过 VF 创建。"; return 0; fi
+    fi
+
+    local total=0
+    [[ -f "$devdir/sriov_totalvfs" ]] && total=$(cat "$devdir/sriov_totalvfs")
+    if [[ "$total" -le 0 ]]; then
+        warn "该设备报告不支持 SR-IOV（totalvfs=$total），跳过。"
+        return 0
+    fi
+    ok "设备最大 VF 数量：$total"
+
+    read -rp "  请输入要创建的 VF 数量（1-$total，回车跳过）: " n
+    [[ -z "$n" ]] && { warn "跳过 VF 创建。"; return 0; }
+    if ! [[ "$n" -ge 1 && "$n" -le "$total" ]]; then
+        warn "输入无效，跳过 VF 创建。"; return 0
+    fi
+    
+    echo 0 > "$devdir/sriov_numvfs"
+    echo "$n" > "$devdir/sriov_numvfs"
+    ok "已临时创建 $n 个 VF。"
+
+    read -rp "  是否将 VF 创建持久化，以便开机自动生效？[y/N]: " p
+    [[ "$p" =~ ^[Yy]$ ]] || { warn "跳过持久化。"; return 0; }
+
+    echo "  请选择持久化方式："
+    echo "    1) sysfsutils (传统，写入 /etc/sysfs.conf)"
+    echo "    2) systemd 服务 (推荐，创建 i915-sriov-vf.service)"
+    read -rp "  请输入数字 [1/2]（默认 2）： " m
+    m="${m:-2}"
+
+    if [[ "$m" == "1" ]]; then
+        local sysfs_file="/etc/sysfs.conf"
+        backup_file "$sysfs_file"
+        apt_install sysfsutils
+        local rel_path; rel_path=$(realpath --relative-to=/sys "$devdir")
+        sed -i '\|sriov_numvfs|d' "$sysfs_file"
+        echo "${rel_path}/sriov_numvfs = ${n}" >> "$sysfs_file"
+        ok "已写入 $sysfs_file"
+    else
+        local svc_file="/etc/systemd/system/i915-sriov-vf.service"
+        backup_file "$svc_file"
+        cat > "$svc_file" <<EOF
+[Unit]
+Description=Configure i915 SR-IOV VFs
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 0 > ${devdir}/sriov_numvfs; echo ${n} > ${devdir}/sriov_numvfs'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable i915-sriov-vf.service
+        ok "已启用持久化服务 i915-sriov-vf.service"
+    fi
+}
+
+# --- 主流程 ---
+main() {
+    echo -e "${C_BLUE}======================================================${C_RESET}"
+    echo -e "${C_BLUE}  Intel i915 SR-IOV 驱动一键安装脚本 v${SCRIPT_VERSION}${C_RESET}"
+    echo -e "${C_BLUE}  GitHub: https://github.com/iHub-2020/PVE_Utilities${C_RESET}"
+    echo -e "${C_BLUE}======================================================${C_RESET}"
+
+    require_root
+    
+    check_dependencies
+    detect_environment
+    fetch_latest_dkms_info
+    fetch_supported_kernel_range
+    collect_kernel_info
+
+    upgrade_kernel_if_needed
+    cleanup_old_kernels
+    configure_kernel_params
+    install_dkms_package
+    configure_vf
+
+    ok "所有配置步骤执行完毕。"
+    warn "强烈建议现在重启系统，以确保所有更改（内核、参数、模块、VF）完全生效。"
+    trap - ERR INT TERM
+}
+
+main "$@"
