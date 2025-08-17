@@ -83,7 +83,7 @@ ASSUME_YES="${ASSUME_YES:-0}"   # 设置为1可在多数交互中默认“是”
 NONINTERACTIVE="${NONINTERACTIVE:-0}"  # 设置为1可尽量减少交互
 
 # --- 帮助文本（长帮助，保留以维持历史行数与可读性） ---
-read -r -d '' HELP_TEXT <<'EOS'
+HELP_TEXT="$(cat <<'EOS'
 用法:
   sudo bash setup-i915-sriov.sh [选项]
 
@@ -129,6 +129,7 @@ read -r -d '' HELP_TEXT <<'EOS'
   - 本脚本会修改 /etc/default/grub、/etc/modprobe.d/* 与 systemd 服务文件，均会先备份再写入；
   - 若中途失败，on_error 会尝试基于记录的备份进行回滚；已安装的软件包不会自动卸载。
 EOS
+)"
 
 # --- 日志辅助 ---
 log_debug() {
